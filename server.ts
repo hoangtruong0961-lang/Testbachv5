@@ -18,6 +18,30 @@ import { GoogleGenAI, Type } from '@google/genai';
 import dotenv from 'dotenv';
 import multer from 'multer';
 import util from 'util';
+import {
+  ensureDeviceLicense,
+  activateLicense,
+  verifyLicense,
+  deactivateLicense,
+  loadLicenseStore,
+  adminCreateKey,
+  adminResetKeyDevices,
+  adminRevokeKey,
+  adminDeleteKey,
+  adminBuffTarget,
+  adminListConnectedDevices,
+  isSuperAdminCredential,
+  verifySignedLicenseToken,
+  generateSignedLicenseToken,
+  MASTER_ADMIN_KEY,
+  WHITELISTED_ADMIN_IMEIS,
+  WHITELISTED_ADMIN_IPS
+} from './src/server/licenseService';
+import {
+  validateAndExtractGeminiWebSession,
+  executeGeminiWebPrompt,
+  GeminiWebSession
+} from './src/server/geminiWebService';
 
 const execPromise = util.promisify(exec);
 const execFilePromise = util.promisify(execFile);
@@ -1529,51 +1553,66 @@ ${JSON.stringify(chunk.map((s: any) => {
 }))}`;
 
             try {
-              const isProxyMode = (req.body.apiMode === 'proxy');
-              const genConfig: any = {
-                responseMimeType: 'application/json',
-              };
+              let responseText = '';
 
-              if (!isProxyMode) {
-                genConfig.responseSchema = {
-                  type: Type.OBJECT,
-                  properties: {
-                    translations: {
-                      type: Type.ARRAY,
-                      items: {
-                        type: Type.OBJECT,
-                        properties: {
-                          id: { type: Type.STRING },
-                          translatedText: { type: Type.STRING },
-                        },
-                        required: ['id', 'translatedText'],
-                      },
-                    },
-                    newEntities: {
-                      type: Type.ARRAY,
-                      description: 'Any newly discovered character names or locations in this batch',
-                      items: {
-                        type: Type.OBJECT,
-                        properties: {
-                          original: { type: Type.STRING },
-                          translated: { type: Type.STRING },
-                          type: { type: Type.STRING },
-                        },
-                        required: ['original', 'translated'],
-                      },
-                    },
-                  },
-                  required: ['translations'],
+              if (req.body.apiMode === 'gemini_web' && req.body.geminiWebCookie) {
+                const session = await validateAndExtractGeminiWebSession(req.body.geminiWebCookie.trim());
+                if (!session.valid || !session.snlm0e) {
+                  throw new Error(session.error || 'Phiên Google Account Gemini Web đã hết hạn hoặc không hợp lệ.');
+                }
+                const rpcRes = await executeGeminiWebPrompt(prompt, session);
+                if (!rpcRes.success || !rpcRes.text) {
+                  throw new Error(rpcRes.error || 'Lỗi nhận dữ liệu từ Google Gemini Web RPC.');
+                }
+                responseText = rpcRes.text.trim();
+              } else {
+                const isProxyMode = (req.body.apiMode === 'proxy');
+                const genConfig: any = {
+                  responseMimeType: 'application/json',
                 };
+
+                if (!isProxyMode) {
+                  genConfig.responseSchema = {
+                    type: Type.OBJECT,
+                    properties: {
+                      translations: {
+                        type: Type.ARRAY,
+                        items: {
+                          type: Type.OBJECT,
+                          properties: {
+                            id: { type: Type.STRING },
+                            translatedText: { type: Type.STRING },
+                          },
+                          required: ['id', 'translatedText'],
+                        },
+                      },
+                      newEntities: {
+                        type: Type.ARRAY,
+                        description: 'Any newly discovered character names or locations in this batch',
+                        items: {
+                          type: Type.OBJECT,
+                          properties: {
+                            original: { type: Type.STRING },
+                            translated: { type: Type.STRING },
+                            type: { type: Type.STRING },
+                          },
+                          required: ['original', 'translated'],
+                        },
+                      },
+                    },
+                    required: ['translations'],
+                  };
+                }
+
+                const response = await generateContentWithRetry(ai, {
+                  model: selectedModel,
+                  contents: prompt,
+                  config: genConfig,
+                });
+
+                responseText = (response.text || '{}').trim();
               }
 
-              const response = await generateContentWithRetry(ai, {
-                model: selectedModel,
-                contents: prompt,
-                config: genConfig,
-              });
-
-              let responseText = (response.text || '{}').trim();
               if (responseText.startsWith('```')) {
                 responseText = responseText.replace(/^```[a-zA-Z]*\n?/, '').replace(/\n?```$/, '').trim();
               }
@@ -4306,46 +4345,305 @@ ${JSON.stringify(compactChunk)}`;
   });
 
   // ==========================================
-  // GEMINI WEB / GOOGLE ACCOUNT WEBVIEW API
+  // LICENSE MANAGEMENT & ACTIVATION API (MODEL 2)
+  // ==========================================
+  
+  // Helper to extract client IP address
+  const getClientIp = (req: express.Request): string => {
+    const forwarded = req.headers['x-forwarded-for'];
+    if (typeof forwarded === 'string') {
+      return forwarded.split(',')[0].trim();
+    }
+    return req.socket.remoteAddress || req.ip || '';
+  };
+
+  // Unified Admin Authentication Helper (Server-Authoritative)
+  const checkAdminAuth = (req: express.Request): { isAuthorized: boolean; reason?: string } => {
+    const ip = getClientIp(req);
+    const adminKey = (req.query.key as string) || (req.headers['x-admin-key'] as string) || req.body?.adminKey;
+    const imei = (req.headers['x-imei'] as string) || req.body?.imei;
+    const token = (req.headers['x-license-token'] as string) || (req.query.token as string) || req.body?.licenseToken;
+
+    // 1. Check IP, IMEI, or Master Key whitelist
+    if (isSuperAdminCredential({ key: adminKey, imei, ip })) {
+      return { isAuthorized: true };
+    }
+
+    // 2. Check cryptographic signed token
+    if (token) {
+      const verified = verifySignedLicenseToken(token);
+      if (verified.valid && verified.payload && (verified.payload.role === 'admin' || verified.payload.isSuperAdmin)) {
+        return { isAuthorized: true };
+      }
+    }
+
+    return { isAuthorized: false, reason: 'Từ chối truy cập: Yêu cầu quyền Super Admin' };
+  };
+
+  // Ensure / Auto-provision device license for new user
+  app.post('/api/license/ensure-device', (req, res) => {
+    try {
+      const { deviceId, deviceName, imei, email } = req.body || {};
+      const ip = getClientIp(req);
+      const result = ensureDeviceLicense({
+        deviceId,
+        deviceName,
+        imei,
+        ip,
+        email
+      });
+      res.json(result);
+    } catch (err: any) {
+      console.error('[License API] Ensure device error:', err);
+      res.status(500).json({ success: false, message: 'Lỗi khởi tạo license thiết bị: ' + err.message });
+    }
+  });
+
+  app.post('/api/license/activate', (req, res) => {
+    try {
+      const { key, deviceId, deviceName, imei } = req.body || {};
+      const ip = getClientIp(req);
+      const result = activateLicense({
+        key,
+        deviceId,
+        deviceName,
+        imei,
+        ip
+      });
+      res.json(result);
+    } catch (err: any) {
+      console.error('[License API] Activate error:', err);
+      res.status(500).json({ success: false, message: 'Lỗi kích hoạt license: ' + err.message });
+    }
+  });
+
+  app.post('/api/license/verify', (req, res) => {
+    try {
+      const { key, deviceId, imei } = req.body || {};
+      const ip = getClientIp(req);
+      const result = verifyLicense({
+        key,
+        deviceId,
+        imei,
+        ip
+      });
+      res.json(result);
+    } catch (err: any) {
+      console.error('[License API] Verify error:', err);
+      res.status(500).json({ valid: false, message: 'Lỗi xác thực license: ' + err.message });
+    }
+  });
+
+  app.post('/api/license/deactivate', (req, res) => {
+    try {
+      const { key, deviceId } = req.body || {};
+      const result = deactivateLicense({ key, deviceId });
+      res.json(result);
+    } catch (err: any) {
+      console.error('[License API] Deactivate error:', err);
+      res.status(500).json({ success: false, message: 'Lỗi hủy kích hoạt license: ' + err.message });
+    }
+  });
+
+  // Admin API: List all created licenses
+  app.get('/api/license/admin/list-keys', (req, res) => {
+    try {
+      const auth = checkAdminAuth(req);
+      if (!auth.isAuthorized) {
+        return res.status(403).json({ success: false, message: auth.reason || 'Từ chối truy cập: Yêu cầu quyền Super Admin' });
+      }
+
+      const store = loadLicenseStore();
+      res.json({
+        success: true,
+        licenses: store.licenses,
+        whitelistedImeis: store.whitelistedImeis,
+        whitelistedIps: store.whitelistedIps
+      });
+    } catch (err: any) {
+      res.status(500).json({ success: false, message: 'Lỗi nạp danh sách license: ' + err.message });
+    }
+  });
+
+  // Admin API: Create new license key(s)
+  app.post('/api/license/admin/create-key', (req, res) => {
+    try {
+      const auth = checkAdminAuth(req);
+      if (!auth.isAuthorized) {
+        return res.status(403).json({ success: false, message: auth.reason || 'Từ chối truy cập: Yêu cầu quyền Super Admin' });
+      }
+
+      const { plan, customDays, maxDevices, note, count, customPrefix } = req.body || {};
+
+      const result = adminCreateKey({
+        plan: plan || 'month',
+        customDays,
+        maxDevices: maxDevices || 2,
+        note,
+        count: count || 1,
+        customPrefix
+      });
+
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ success: false, message: 'Lỗi tạo mã license: ' + err.message });
+    }
+  });
+
+  // Admin API: Reset devices for a key
+  app.post('/api/license/admin/reset-devices', (req, res) => {
+    try {
+      const auth = checkAdminAuth(req);
+      if (!auth.isAuthorized) {
+        return res.status(403).json({ success: false, message: auth.reason || 'Từ chối truy cập: Yêu cầu quyền Super Admin' });
+      }
+
+      const { key } = req.body || {};
+
+      if (!key) {
+        return res.status(400).json({ success: false, message: 'Thiếu license key cần reset' });
+      }
+
+      const result = adminResetKeyDevices(key);
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ success: false, message: 'Lỗi reset thiết bị: ' + err.message });
+    }
+  });
+
+  // Admin API: Revoke a key
+  app.post('/api/license/admin/revoke-key', (req, res) => {
+    try {
+      const auth = checkAdminAuth(req);
+      if (!auth.isAuthorized) {
+        return res.status(403).json({ success: false, message: auth.reason || 'Từ chối truy cập: Yêu cầu quyền Super Admin' });
+      }
+
+      const { key } = req.body || {};
+
+      if (!key) {
+        return res.status(400).json({ success: false, message: 'Thiếu license key cần thu hồi' });
+      }
+
+      const result = adminRevokeKey(key);
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ success: false, message: 'Lỗi thu hồi key: ' + err.message });
+    }
+  });
+
+  // Admin API: Delete a key permanently
+  app.post('/api/license/admin/delete-key', (req, res) => {
+    try {
+      const auth = checkAdminAuth(req);
+      if (!auth.isAuthorized) {
+        return res.status(403).json({ success: false, message: auth.reason || 'Từ chối truy cập: Yêu cầu quyền Super Admin' });
+      }
+
+      const { key } = req.body || {};
+
+      if (!key) {
+        return res.status(400).json({ success: false, message: 'Thiếu license key cần xóa' });
+      }
+
+      const result = adminDeleteKey(key);
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ success: false, message: 'Lỗi xóa key: ' + err.message });
+    }
+  });
+
+  // Admin API: Buff VIP / Grant License to any Target (Device ID, IMEI, IP, or Key)
+  app.post('/api/license/admin/buff-target', (req, res) => {
+    try {
+      const auth = checkAdminAuth(req);
+      if (!auth.isAuthorized) {
+        return res.status(403).json({ success: false, message: auth.reason || 'Từ chối truy cập: Yêu cầu quyền Super Admin' });
+      }
+
+      const { target, plan, customDays, note } = req.body || {};
+
+      if (!target) {
+        return res.status(400).json({ success: false, message: 'Thiếu thông tin Target (Device ID / IMEI / IP / Key) cần Buff' });
+      }
+
+      const result = adminBuffTarget({
+        target,
+        plan: plan || 'month',
+        customDays: customDays ? Number(customDays) : undefined,
+        note
+      });
+
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ success: false, message: 'Lỗi thực hiện Buff VIP: ' + err.message });
+    }
+  });
+
+  // Admin API: List all connected devices
+  app.get('/api/license/admin/list-devices', (req, res) => {
+    try {
+      const auth = checkAdminAuth(req);
+      if (!auth.isAuthorized) {
+        return res.status(403).json({ success: false, message: auth.reason || 'Từ chối truy cập: Yêu cầu quyền Super Admin' });
+      }
+
+      const result = adminListConnectedDevices();
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ success: false, message: 'Lỗi nạp danh sách thiết bị: ' + err.message });
+    }
+  });
+
+  // ==========================================
+  // GEMINI WEB / GOOGLE ACCOUNT REVERSE ENGINE API (REAL GOOGLE SESSION)
   // ==========================================
   app.post('/api/gemini-web/check-token', async (req, res) => {
     try {
-      const { cookie, accountEmail, googleAccountConnected, apiKey } = req.body || {};
+      const { cookie } = req.body || {};
       const logs: string[] = [];
       const addLog = (msg: string) => {
         const time = new Date().toLocaleTimeString('vi-VN', { hour12: false });
         logs.push(`[${time}] ${msg}`);
       };
 
-      addLog('[WebView] Headless WebView container khởi tạo thành công (DOM Ready).');
-      addLog('[WebView] Kết nối https://gemini.google.com trong luồng nền...');
-
-      let token = 'SNlM0e_' + Math.random().toString(36).substring(2, 12) + '_' + Date.now();
-      let email = accountEmail || 'offlang533@gmail.com';
-      let accountName = 'Google User';
-
-      if (cookie && cookie.trim()) {
-        addLog('[CookieManager] Đã nhận diện Cookie tùy chỉnh: __Secure-1PSID / SAPISID');
-        if (cookie.includes('__Secure-1PSID')) {
-          addLog('[CookieManager] Phân tích header cookie: Xác thực định danh Google thành công.');
-        } else {
-          addLog('[CookieManager] Chuỗi cookie hợp lệ, đã nạp vào CookieJar WebView.');
-        }
-      } else {
-        addLog('[CookieManager] Sử dụng Google Session tự động từ trình duyệt/hệ thống.');
+      if (!cookie || !cookie.trim()) {
+        addLog('[GoogleAuth Error] Chưa có Cookie. Vui lòng dán cookie từ gemini.google.com (__Secure-1PSID).');
+        return res.json({
+          success: false,
+          tokenReady: false,
+          error: 'Chưa có Cookie. Vui lòng đăng nhập gemini.google.com trên trình duyệt, copy cookie (__Secure-1PSID) và dán vào ô bên dưới.',
+          logs
+        });
       }
 
-      addLog('[AuthEngine] checkToken: Gửi handshake xác thực tới Gemini API Gateway...');
-      addLog('[AuthEngine] Nhận diện trạng thái: Session Token Sẵn Sàng (Token ready).');
-      addLog(`[AuthEngine] Tài khoản hoạt động: ${email} | ID phiên: ${token.slice(0, 16)}...`);
+      addLog('[GeminiWeb] Đang gửi yêu cầu xác thực phiên thật tới https://gemini.google.com/app...');
+      const session = await validateAndExtractGeminiWebSession(cookie.trim());
+
+      if (!session.valid || !session.snlm0e) {
+        addLog(`[GeminiWeb Auth Failed] ${session.error || 'Phiên Google Cookie không hợp lệ hoặc đã hết hạn.'}`);
+        return res.json({
+          success: false,
+          tokenReady: false,
+          error: session.error || 'Cookie Google không hợp lệ hoặc đã hết hạn. Vui lòng đăng nhập lại.',
+          logs
+        });
+      }
+
+      addLog('[GeminiWeb] Trích xuất thành công mã định danh SNlM0e bảo mật từ Google Gemini Web.');
+      if (session.email) {
+        addLog(`[GeminiWeb] Tài khoản Google nhận diện: ${session.email}`);
+      }
+      addLog(`[GeminiWeb] Token SNlM0e: ${session.snlm0e.slice(0, 12)}... (Xác thực thực tế 100%)`);
+      addLog('[GeminiWeb] Sẵn sàng gửi câu lệnh trực tiếp qua giao thức Google RPC (Không tốn quota API Key).');
 
       res.json({
         success: true,
         tokenReady: true,
-        token,
-        email,
-        accountName,
-        message: 'Token ready! Phiên đăng nhập Google Account trên WebView ẩn đã sẵn sàng.',
+        token: session.snlm0e,
+        email: session.email || 'Tài khoản Google Cá Nhân',
+        accountName: session.email ? session.email.split('@')[0] : 'Google User',
+        message: '✓ Xác thực Cookie Google thật thành công! Phiên kết nối RPC Gemini Web đã sẵn sàng.',
         logs,
       });
     } catch (err: any) {
@@ -4353,15 +4651,15 @@ ${JSON.stringify(compactChunk)}`;
       res.status(500).json({
         success: false,
         tokenReady: false,
-        error: err.message || 'Lỗi kiểm tra token',
-        logs: [`[Error] ${err.message || 'Lỗi server'}`],
+        error: err.message || 'Lỗi kiểm tra token Google Web',
+        logs: [`[Error] ${err.message || 'Lỗi kết nối'}`],
       });
     }
   });
 
   app.post('/api/gemini-web/execute-prompt', async (req, res) => {
     try {
-      const { prompt, cookie, apiKey } = req.body || {};
+      const { prompt, cookie } = req.body || {};
       const logs: string[] = [];
       const addLog = (msg: string) => {
         const time = new Date().toLocaleTimeString('vi-VN', { hour12: false });
@@ -4372,50 +4670,49 @@ ${JSON.stringify(compactChunk)}`;
         return res.status(400).json({ success: false, error: 'Missing prompt' });
       }
 
-      addLog('[evaluateJavascript] Chuẩn bị script bơm vào input text area của gemini.google.com...');
-      addLog(`[evaluateJavascript] Kích thước prompt: ${prompt.length} ký tự.`);
-      addLog('[executeJsFetch] Kích hoạt sự kiện submit ngầm trong headless WebView...');
-      addLog('[WebView] Đang lắng nghe luồng DOM stream response từ gemini.google.com...');
-
-      let responseText = '';
-
-      // Attempt to execute via Gemini model if API key available or fallback to AI service
-      try {
-        const { ai, selectedModel } = getAiClientAndModel({ apiKey, selectedModel: 'gemini-2.5-flash' });
-        const response = await ai.models.generateContent({
-          model: 'gemini-2.5-flash',
-          contents: [{ role: 'user', parts: [{ text: prompt }] }],
+      if (!cookie || !cookie.trim()) {
+        return res.status(400).json({
+          success: false,
+          error: 'Thiếu Cookie phiên Google. Vui lòng thiết lập Cookie ở mục Cài Đặt (Mode 3: Google Account).'
         });
-        responseText = response.text || '';
-      } catch (aiErr: any) {
-        addLog(`[Gemini Engine Fallback] ${aiErr.message || 'Direct stream parser fallback'}`);
-        // If AI call failed, provide a clean structured demo response matching prompt
-        responseText = JSON.stringify(
-          [
-            {
-              id: '1',
-              original: '师傅，徒儿这就去！',
-              translation: 'Sư phụ, đồ nhi đi ngay đây!',
-            },
-          ],
-          null,
-          2
-        );
       }
 
-      addLog('[DOM Parser] Trích xuất thành công văn bản dịch từ DOM thẻ kết quả.');
-      addLog('[Dedup Filter] Hoàn tất lọc trùng và làm sạch văn bản phụ đề.');
+      addLog(`[GeminiWeb RPC] Đang chuẩn bị gửi câu lệnh (${prompt.length} ký tự) tới Google Web backend...`);
+      
+      const session = await validateAndExtractGeminiWebSession(cookie.trim());
+      if (!session.valid || !session.snlm0e) {
+        addLog(`[GeminiWeb RPC Error] ${session.error || 'Cookie Google đã hết hạn.'}`);
+        return res.status(401).json({
+          success: false,
+          error: session.error || 'Cookie Google đã hết hạn. Vui lòng cập nhật Cookie mới.',
+          logs
+        });
+      }
+
+      addLog('[GeminiWeb RPC] Đang gọi API nội bộ Google BardFrontendService/StreamGenerate...');
+      const rpcResult = await executeGeminiWebPrompt(prompt, session);
+
+      if (!rpcResult.success || !rpcResult.text) {
+        addLog(`[GeminiWeb RPC Failure] ${rpcResult.error || 'Không nhận được văn bản từ Google Web.'}`);
+        return res.status(502).json({
+          success: false,
+          error: rpcResult.error || 'Không nhận được kết quả dịch từ Google Gemini Web.',
+          logs
+        });
+      }
+
+      addLog('[GeminiWeb RPC] Đã nhận và phân tích thành công phản hồi luồng từ Google Gemini Web.');
 
       res.json({
         success: true,
-        text: responseText,
+        text: rpcResult.text,
         logs,
       });
     } catch (err: any) {
       console.error('[Gemini Web Execute Prompt Error]', err);
       res.status(500).json({
         success: false,
-        error: err.message || 'Lỗi thực thi prompt trên WebView',
+        error: err.message || 'Lỗi thực thi prompt trên Gemini Web RPC',
         logs: [`[Error] ${err.message || 'Lỗi server'}`],
       });
     }

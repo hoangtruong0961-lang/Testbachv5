@@ -22,7 +22,10 @@ import {
   CheckCircle,
   RefreshCw,
   HardDrive,
+  Crown,
+  KeyRound,
 } from 'lucide-react';
+import { LicenseState } from '../utils/licenseManager';
 import {
   Project,
   CapCutTab,
@@ -70,6 +73,8 @@ interface CapCutEditorViewProps {
   appSettings: AppSettings;
   onSaveSettings: (newSettings: AppSettings) => void;
   onOpenSettings?: () => void;
+  licenseState?: LicenseState | null;
+  onOpenLicense?: () => void;
 }
 
 export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
@@ -81,6 +86,8 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
   appSettings,
   onSaveSettings,
   onOpenSettings,
+  licenseState,
+  onOpenLicense,
 }) => {
   const [projectTitle, setProjectTitle] = useState<string>(project.title);
   const [videoUrl, setVideoUrl] = useState<string>(project.videoUrl);
@@ -1796,6 +1803,7 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
                 knownEntityGlossary: runningGlossary,
                 previousContext: previousContextBuffer,
                 apiMode: appSettings?.apiMode,
+                geminiWebCookie: appSettings?.geminiWebCookie,
                 apiKey: appSettings?.apiKey,
                 proxyUrl: appSettings?.proxyUrl,
                 proxyKey: appSettings?.proxyKey,
@@ -2680,8 +2688,20 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
             <X className="w-4 h-4" />
           </button>
 
-          {/* Right: Real Video Resolution Badge (Right Next to Export) & Export Button */}
+          {/* Center/Right: License Badge, Real Video Resolution & Export Button */}
           <div className="flex items-center space-x-2">
+            {/* Admin Control Panel Button (Only for Super Admin Tien Ly) */}
+            {onOpenLicense && licenseState?.isAdmin && (
+              <button
+                onClick={onOpenLicense}
+                className="flex items-center space-x-1 px-2.5 py-0.5 rounded-md text-[10px] font-black transition-all shadow-sm active:scale-95 cursor-pointer bg-gradient-to-r from-amber-400 to-yellow-300 text-slate-950 hover:brightness-110"
+                title="Trung Tâm Quản Trị Super Admin & Buff VIP"
+              >
+                <Crown className="w-3 h-3 fill-slate-950" />
+                <span>👑 ADMIN VIP</span>
+              </button>
+            )}
+
             {videoUrl && (
               <div 
                 className="bg-slate-800/90 border border-slate-700/80 text-slate-200 text-[10px] px-2 py-0.5 rounded-md font-mono font-bold flex items-center space-x-1 shadow-sm select-none"
@@ -2710,6 +2730,35 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
 
         {/* 2. Editor Main Canvas Body */}
         <div className="flex-1 flex flex-col overflow-hidden relative bg-[#0b0b0d]">
+          {/* License Lock Overlay if license is invalid or expired */}
+          {licenseState && !licenseState.isPro && !licenseState.isAdmin && (
+            <div className="absolute inset-0 z-50 bg-slate-950/90 backdrop-blur-md flex flex-col items-center justify-center p-6 text-center animate-fade-in">
+              <div className="w-16 h-16 rounded-2xl bg-gradient-to-tr from-amber-600 via-amber-400 to-yellow-200 border border-amber-300/60 flex items-center justify-center text-slate-950 mb-4 shadow-2xl shadow-amber-500/20">
+                <Crown className="w-8 h-8" />
+              </div>
+              <h2 className="text-xl font-bold text-white mb-2">Trình Biên Tập Đã Bị Khóa Bản Quyền</h2>
+              <p className="text-xs text-slate-300 max-w-md mb-6 leading-relaxed">
+                Thiết bị chưa được kích hoạt bản quyền hợp lệ hoặc giấy phép đã hết hạn. Vui lòng kích hoạt mã bản quyền hoặc liên hệ Quản trị viên để tiếp tục sử dụng tính năng bóc tách, dịch thuật và xuất video.
+              </p>
+              <div className="flex items-center space-x-3">
+                <button
+                  onClick={onBackToHome}
+                  className="px-4 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-bold transition"
+                >
+                  Về Trang Chủ
+                </button>
+                {onOpenLicense && (
+                  <button
+                    onClick={onOpenLicense}
+                    className="px-5 py-2.5 rounded-xl bg-gradient-to-r from-amber-400 via-yellow-300 to-amber-500 hover:brightness-110 text-slate-950 text-xs font-black shadow-lg shadow-amber-500/20 transition active:scale-95"
+                  >
+                    Kích Hoạt Bản Quyền Ngay
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
+
           {/* Responsive Video Canvas Container */}
           <div className="flex-1 min-h-0 p-2 flex items-center justify-center overflow-hidden bg-black">
             <div className="w-full h-full max-h-full flex items-center justify-center min-h-0">
@@ -3348,6 +3397,7 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
               <ConfigView
                 settings={appSettings}
                 onSaveSettings={onSaveSettings}
+                onOpenLicense={onOpenLicense}
               />
             </div>
           </div>

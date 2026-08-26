@@ -35,6 +35,14 @@ import {
   Info,
   UserCheck,
   UserX,
+  User,
+  Fingerprint,
+  Copy,
+  Check,
+  Crown,
+  ShieldAlert,
+  Laptop,
+  Cloud,
 } from 'lucide-react';
 import { AppSettings, GeminiModelOption, ApiConnectionMode, TTSProviderOption } from '../types';
 import { DEFAULT_APP_SETTINGS } from '../utils/settingsStorage';
@@ -44,15 +52,20 @@ import {
   clearPaddleOcrCache,
   PaddleOcrModelStatus,
 } from '../utils/localPaddleOcrEngine';
+import { getDeviceFingerprint, DeviceInfo } from '../utils/deviceFingerprint';
+import { getCurrentLicenseState, subscribeLicenseState, LicenseState } from '../utils/licenseManager';
+import { getFirebaseUser } from '../services/firebaseLicenseService';
 
 interface ConfigViewProps {
   settings: AppSettings;
   onSaveSettings: (newSettings: AppSettings) => void;
+  onOpenLicense?: () => void;
 }
 
 export const ConfigView: React.FC<ConfigViewProps> = ({
   settings,
   onSaveSettings,
+  onOpenLicense,
 }) => {
   const [formData, setFormData] = useState<AppSettings>({
     ...settings,
@@ -63,6 +76,11 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
   const [showTikTokSessionKey, setShowTikTokSessionKey] = useState<boolean>(false);
   const [showTikTokGuide, setShowTikTokGuide] = useState<boolean>(false);
   const [savedToast, setSavedToast] = useState<boolean>(false);
+
+  // Member Code, Device Fingerprint & License State
+  const [deviceInfo, setDeviceInfo] = useState<DeviceInfo | null>(null);
+  const [licenseState, setLicenseState] = useState<LicenseState | null>(null);
+  const [copiedField, setCopiedField] = useState<string | null>(null);
 
   // Proxy Model Fetching State
   const [isFetchingModels, setIsFetchingModels] = useState<boolean>(false);
@@ -101,7 +119,23 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
 
   useEffect(() => {
     refreshPaddleStatus();
+
+    // Fetch device fingerprint & license state
+    getDeviceFingerprint().then((info) => setDeviceInfo(info));
+    getCurrentLicenseState().then((st) => setLicenseState(st));
+    const unsub = subscribeLicenseState((st) => setLicenseState(st));
+
+    return () => {
+      unsub();
+    };
   }, []);
+
+  const handleCopyText = (text: string, fieldName: string) => {
+    if (!text) return;
+    navigator.clipboard.writeText(text);
+    setCopiedField(fieldName);
+    setTimeout(() => setCopiedField(null), 2000);
+  };
 
   const handleDownloadPaddleModels = async () => {
     setIsDownloadingPaddle(true);
@@ -286,10 +320,8 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
   const handleCheckGoogleToken = async (customCookie?: string) => {
     setIsCheckingGoogleToken(true);
     setGoogleAuthMessage(null);
-    appendGoogleLog('[WebView] Khởi tạo Headless WebView ẩn (offscreen background container ready)...');
-    appendGoogleLog('[WebView] Đang tải trang https://gemini.google.com trong luồng nền...');
-    appendGoogleLog('[CookieManager] Tự động đọc cookie/phiên đăng nhập Google Account...');
-    appendGoogleLog('[AuthEngine] checkToken: Đang gửi handshake kiểm tra phiên...');
+    appendGoogleLog('[GeminiWeb] Đang gửi yêu cầu bắt tay xác thực tới https://gemini.google.com/app...');
+    appendGoogleLog('[CookieManager] Phân tích cookie Google (__Secure-1PSID)...');
 
     try {
       const cookieToSend = customCookie !== undefined ? customCookie : formData.geminiWebCookie;
@@ -299,8 +331,6 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
         body: JSON.stringify({
           cookie: cookieToSend,
           accountEmail: formData.googleAccountEmail,
-          googleAccountConnected: formData.googleAccountConnected,
-          apiKey: formData.apiKey,
         }),
       });
 
@@ -321,15 +351,15 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
           ...formData,
           apiMode: 'gemini_web',
           googleAccountConnected: true,
-          googleAccountEmail: data.email || formData.googleAccountEmail || 'google.user@gmail.com',
+          googleAccountEmail: data.email || formData.googleAccountEmail || 'Tài khoản Google',
           googleAccountName: data.accountName || 'Google User',
           geminiWebSessionToken: data.token,
           geminiWebAccountStatus: 'token_ready',
-          ...(customCookie !== undefined ? { geminiWebCookie: customCookie } : {}),
+          ...(cookieToSend ? { geminiWebCookie: cookieToSend } : {}),
         };
         setFormData(updated);
         onSaveSettings(updated);
-        setGoogleAuthMessage({ text: '✓ Token ready! Phiên đăng nhập Google Account trên WebView ẩn đã sẵn sàng.', isError: false });
+        setGoogleAuthMessage({ text: '✓ Xác thực Cookie Google thật thành công! Mã bảo mật SNlM0e đã sẵn sàng.', isError: false });
         showToastNotification();
       } else {
         const updated: AppSettings = {
@@ -338,20 +368,14 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
         };
         setFormData(updated);
         onSaveSettings(updated);
-        setGoogleAuthMessage({ text: data.message || 'Token missing: Chưa tìm thấy phiên Google hợp lệ. Vui lòng đăng nhập hoặc nhập Cookie.', isError: true });
+        setGoogleAuthMessage({ text: data.error || data.message || 'Token missing: Cookie không hợp lệ hoặc đã hết hạn. Vui lòng nhập lại Cookie __Secure-1PSID.', isError: true });
       }
     } catch (err: any) {
-      appendGoogleLog(`[AuthEngine Error] ${err.message || 'Lỗi kết nối WebView'}`);
+      appendGoogleLog(`[GeminiWeb Auth Error] ${err.message || 'Lỗi kết nối'}`);
       setGoogleAuthMessage({ text: 'Lỗi kiểm tra Token: ' + (err.message || 'Mất kết nối'), isError: true });
     } finally {
       setIsCheckingGoogleToken(false);
     }
-  };
-
-  const handleGoogleQuickLogin = async () => {
-    const defaultEmail = formData.googleAccountEmail || 'user.google@gmail.com';
-    appendGoogleLog(`[GoogleAuth] Đang mở luồng đăng nhập Google Account: ${defaultEmail}...`);
-    await handleCheckGoogleToken();
   };
 
   const handleGoogleLogout = () => {
@@ -366,17 +390,15 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
     setFormData(updated);
     onSaveSettings(updated);
     showToastNotification();
-    appendGoogleLog('[GoogleAuth] Đã ngắt kết nối tài khoản Google và xóa phiên làm việc WebView.');
-    setGoogleAuthMessage({ text: 'Đã ngắt kết nối tài khoản Google.', isError: false });
+    appendGoogleLog('[GoogleAuth] Đã xóa phiên Cookie và ngắt kết nối Gemini Web.');
+    setGoogleAuthMessage({ text: 'Đã xóa cookie và ngắt kết nối tài khoản Google.', isError: false });
     setTestPromptResult(null);
   };
 
   const handleTestGeminiPrompt = async () => {
     setIsTestingGeminiPrompt(true);
     setTestPromptResult(null);
-    appendGoogleLog('[Test Automation] Chuẩn bị gửi prompt test dịch thử nghiệm...');
-    appendGoogleLog('[evaluateJavascript] Bơm JavaScript vào ô chat của gemini.google.com trong WebView ẩn...');
-    appendGoogleLog('[executeJsFetch] Kích hoạt sự kiện submit ngầm...');
+    appendGoogleLog('[Test RPC] Chuẩn bị gửi prompt test dịch tới Google Gemini Web RPC...');
 
     try {
       const samplePrompt = `Dịch dòng phụ đề sau sang tiếng Việt tự nhiên: "师傅，徒儿这就去！" Trả về định dạng JSON: [{"id":"1","original":"师傅，徒儿这就去！","translation":"Sư phụ, đồ nhi đi ngay đây!"}]`;
@@ -386,7 +408,6 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
         body: JSON.stringify({
           prompt: samplePrompt,
           cookie: formData.geminiWebCookie,
-          apiKey: formData.apiKey,
         }),
       });
 
@@ -403,14 +424,14 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
       }
 
       if (data.success && data.text) {
-        appendGoogleLog('[generateContent] Đã nhận và parse thành công kết quả từ DOM!');
+        appendGoogleLog('[GeminiWeb RPC] Đã nhận và parse thành công kết quả từ Google Web!');
         setTestPromptResult(data.text);
       } else {
-        appendGoogleLog(`[Automation Error] ${data.error || 'Không nhận được dữ liệu'}`);
+        appendGoogleLog(`[RPC Error] ${data.error || 'Không nhận được dữ liệu'}`);
         setTestPromptResult('Lỗi: ' + (data.error || 'Không phản hồi'));
       }
     } catch (err: any) {
-      appendGoogleLog(`[Automation Error] ${err.message || 'Lỗi gửi prompt'}`);
+      appendGoogleLog(`[RPC Error] ${err.message || 'Lỗi gửi prompt'}`);
       setTestPromptResult('Lỗi kết nối: ' + err.message);
     } finally {
       setIsTestingGeminiPrompt(false);
@@ -429,6 +450,150 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
           <span>Đã lưu cấu hình cài đặt thành công!</span>
         </div>
       )}
+
+      {/* CARD 0: THÔNG TIN THÀNH VIÊN & BẢN QUYỀN THIẾT BỊ (MÃ THÀNH VIÊN / DEVICE ID) */}
+      <div className="bg-gradient-to-b from-[#181820] to-[#121218] border border-amber-500/30 rounded-2xl p-4 shadow-xl space-y-3.5">
+        {/* Category Header */}
+        <div className="flex items-center justify-between">
+          <div className="flex items-center space-x-1.5 text-[11px] font-bold text-amber-300 uppercase tracking-wider">
+            <span className="w-2 h-2 rounded-full bg-amber-400 inline-block animate-pulse shadow-[0_0_6px_rgba(251,191,36,0.8)]" />
+            <span>THÔNG TIN THÀNH VIÊN & BẢN QUYỀN</span>
+          </div>
+          {licenseState?.isAdmin ? (
+            <span className="text-[10px] bg-gradient-to-r from-amber-500 to-yellow-400 text-slate-950 font-black px-2.5 py-0.5 rounded-full shadow-sm flex items-center gap-1">
+              <Crown className="w-3 h-3 fill-slate-950" />
+              SUPER ADMIN
+            </span>
+          ) : licenseState?.isPro ? (
+            <span className="text-[10px] bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 font-bold px-2.5 py-0.5 rounded-full flex items-center gap-1">
+              <ShieldCheck className="w-3 h-3 text-emerald-400" />
+              {licenseState.plan === 'lifetime' ? 'VIP VĨNH VIỄN' : `GÓI ${licenseState.plan.toUpperCase()}`}
+            </span>
+          ) : (
+            <span className="text-[10px] bg-slate-800 text-slate-400 border border-slate-700 font-bold px-2.5 py-0.5 rounded-full flex items-center gap-1">
+              DÙNG THỬ (TRIAL)
+            </span>
+          )}
+        </div>
+
+        {/* Iconic Header Box */}
+        <div className="flex items-center justify-between gap-3">
+          <div className="flex items-center space-x-3">
+            <div className="w-11 h-11 rounded-2xl bg-gradient-to-tr from-amber-500 via-yellow-400 to-amber-200 border border-amber-300/40 flex items-center justify-center text-slate-950 shadow-lg shadow-amber-500/10">
+              <Fingerprint className="w-6 h-6 text-slate-950" />
+            </div>
+            <div>
+              <h2 className="text-sm font-bold text-white flex items-center gap-1.5">
+                <span>Mã Thành Viên & Định Danh Thiết Bị</span>
+              </h2>
+              <p className="text-[11px] text-slate-400">
+                Mã phần cứng máy tính / trình duyệt duy nhất của bạn
+              </p>
+            </div>
+          </div>
+
+          {onOpenLicense && (
+            <button
+              type="button"
+              onClick={onOpenLicense}
+              className="px-3 py-1.5 bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-400 hover:to-amber-500 text-slate-950 font-bold text-[11px] rounded-xl shadow transition flex items-center gap-1.5 cursor-pointer shrink-0"
+            >
+              <Crown className="w-3.5 h-3.5 fill-slate-950" />
+              <span>{licenseState?.isAdmin ? 'Quản Trị VIP' : 'Nâng Cấp VIP'}</span>
+            </button>
+          )}
+        </div>
+
+        {/* Member Code / Device ID Main Display Box */}
+        <div className="bg-[#0e0e12] border border-amber-500/20 rounded-xl p-3 space-y-2">
+          <div className="flex items-center justify-between">
+            <label className="text-[11px] font-bold text-amber-300 uppercase tracking-wide flex items-center gap-1.5">
+              <User className="w-3.5 h-3.5 text-amber-400" />
+              <span>Mã Thành Viên (Member ID / Device ID):</span>
+            </label>
+            <span className="text-[10px] text-slate-400">Dùng để kích hoạt hoặc cấp quyền VIP</span>
+          </div>
+
+          <div className="flex items-center justify-between gap-2 bg-[#16161e] border border-slate-700/80 rounded-lg px-3 py-2">
+            <span className="font-mono text-xs sm:text-sm font-black text-amber-200 tracking-wider select-all break-all">
+              {deviceInfo?.deviceId || 'Đang nhận diện mã máy...'}
+            </span>
+            <button
+              type="button"
+              onClick={() => handleCopyText(deviceInfo?.deviceId || '', 'deviceId')}
+              className="px-2.5 py-1 bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/40 rounded-lg text-xs font-bold transition flex items-center gap-1 cursor-pointer shrink-0"
+              title="Sao chép Mã Thành Viên"
+            >
+              {copiedField === 'deviceId' ? (
+                <>
+                  <Check className="w-3.5 h-3.5 text-emerald-400" />
+                  <span className="text-emerald-300">Đã chép!</span>
+                </>
+              ) : (
+                <>
+                  <Copy className="w-3.5 h-3.5" />
+                  <span>Sao chép</span>
+                </>
+              )}
+            </button>
+          </div>
+
+          {/* Detailed Specs Grid */}
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 pt-1">
+            {/* IMEI */}
+            <div className="bg-[#121217] border border-slate-800 rounded-lg p-2 flex items-center justify-between">
+              <div className="space-y-0.5 min-w-0 pr-2">
+                <span className="text-[10px] text-slate-400 block font-semibold">Mã IMEI / Định Danh:</span>
+                <span className="font-mono text-[11px] text-slate-200 font-bold truncate block">
+                  {deviceInfo?.imei || 'Chưa thiết lập IMEI'}
+                </span>
+              </div>
+              {deviceInfo?.imei && (
+                <button
+                  type="button"
+                  onClick={() => handleCopyText(deviceInfo.imei || '', 'imei')}
+                  className="p-1 text-slate-400 hover:text-white rounded hover:bg-slate-800 transition cursor-pointer"
+                  title="Sao chép IMEI"
+                >
+                  {copiedField === 'imei' ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
+                </button>
+              )}
+            </div>
+
+            {/* License Plan & Expiry */}
+            <div className="bg-[#121217] border border-slate-800 rounded-lg p-2 flex items-center justify-between">
+              <div className="space-y-0.5 min-w-0">
+                <span className="text-[10px] text-slate-400 block font-semibold">Trạng Thái Bản Quyền:</span>
+                <span className="text-[11px] text-emerald-300 font-bold block">
+                  {licenseState?.isAdmin
+                    ? 'Super Admin (Vĩnh Viễn)'
+                    : licenseState?.isPro
+                    ? `VIP ${licenseState.plan.toUpperCase()} (${licenseState.expiresAt ? new Date(licenseState.expiresAt).toLocaleDateString('vi-VN') : 'Vĩnh Viễn'})`
+                    : 'Gói Dùng Thử Miễn Phí'}
+                </span>
+              </div>
+              <span className="text-[10px] bg-slate-800 text-slate-300 px-2 py-0.5 rounded font-mono">
+                {licenseState?.status === 'active' ? 'Active' : 'Free'}
+              </span>
+            </div>
+          </div>
+
+          {/* Cloud Database Sync Status */}
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-1 pt-1.5 border-t border-slate-800/80 text-[10px] text-slate-400">
+            <span className="flex items-center gap-1.5 text-sky-400 font-medium">
+              <Cloud className="w-3.5 h-3.5" />
+              <span className="flex items-center gap-1">
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping mr-0.5 inline-block" />
+                Firebase Cloud Real-Time Auto Sync: <b className="text-emerald-300">Đã kết nối Firestore</b>
+                {getFirebaseUser()?.email && <span className="text-slate-400">({getFirebaseUser()?.email})</span>}
+              </span>
+            </span>
+            <span className="text-slate-400">
+              Thiết bị: <b className="text-slate-300">{deviceInfo?.deviceName || 'Web Applet'}</b>
+            </span>
+          </div>
+        </div>
+      </div>
 
       {/* CARD 1: OCR ENGINE SELECTOR */}
       <div className="bg-metallic-card border-metallic rounded-2xl p-4 shadow-xl space-y-3">
@@ -682,7 +847,7 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
               <span className="text-[9.5px] text-slate-400">Trạm Gateway</span>
             </button>
 
-            {/* Mode 3 Button: Google Account (Gemini Web Automated WebView) */}
+            {/* Mode 3 Button: Google Account (Gemini Web RPC) */}
             <button
               type="button"
               onClick={() => handleChange('apiMode', 'gemini_web')}
@@ -696,7 +861,7 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
                 <Globe className={`w-4 h-4 ${currentApiMode === 'gemini_web' ? 'text-sky-300' : 'text-slate-400'}`} />
                 <span className="text-xs font-bold">3. Google Account</span>
               </div>
-              <span className="text-[9.5px] text-slate-400">Gemini Web WebView ẩn</span>
+              <span className="text-[9.5px] text-slate-400">Gemini Web RPC (0đ Quota)</span>
             </button>
           </div>
         </div>
@@ -937,29 +1102,29 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
           </div>
         )}
 
-        {/* SECTION FOR MODE 3: GOOGLE ACCOUNT (GEMINI WEB AUTOMATED WEBVIEW - BACHTRANSLATE ENGINE) */}
+        {/* SECTION FOR MODE 3: GOOGLE ACCOUNT (GEMINI WEB REVERSE RPC - 0đ QUOTA) */}
         {currentApiMode === 'gemini_web' && (
           <div className="space-y-3.5 p-3.5 bg-metallic-panel border-metallic rounded-2xl shadow-lg animate-fade-in">
             {/* Header with Title & Token Badge */}
             <div className="flex items-center justify-between border-b border-metallic pb-2.5">
               <div className="flex items-center space-x-2 text-xs font-bold text-metallic-silver">
                 <Globe className="w-4 h-4 text-sky-400" />
-                <span>Google Account & Gemini Web Automated WebView</span>
+                <span>Mode 3: Google Account & Gemini Web RPC (Không tốn Quota API Key)</span>
               </div>
               <div className="flex items-center gap-1.5">
                 {formData.googleAccountConnected && formData.geminiWebAccountStatus === 'token_ready' ? (
                   <span className="flex items-center gap-1 text-[10px] font-bold text-emerald-400 bg-emerald-950/70 border border-emerald-700/60 px-2 py-0.5 rounded-full shadow-sm">
                     <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
-                    TOKEN READY (SẴN SÀNG)
+                    TOKEN READY (SNlM0e SẴN SÀNG)
                   </span>
                 ) : isCheckingGoogleToken ? (
                   <span className="flex items-center gap-1 text-[10px] font-bold text-amber-300 bg-amber-950/70 border border-amber-700/60 px-2 py-0.5 rounded-full">
                     <Loader2 className="w-3 h-3 animate-spin text-amber-300" />
-                    ĐANG CHECK TOKEN...
+                    ĐANG CHECK TOKEN GOOGLE...
                   </span>
                 ) : (
                   <span className="flex items-center gap-1 text-[10px] font-bold text-slate-400 bg-slate-800 border border-slate-700 px-2 py-0.5 rounded-full">
-                    CHƯA KẾT NỐI
+                    CHƯA CÓ TOKEN
                   </span>
                 )}
               </div>
@@ -979,8 +1144,8 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
                   <div className="flex items-center gap-2">
                     <span className="text-xs font-bold text-white">
                       {formData.googleAccountConnected
-                        ? (formData.googleAccountEmail || 'offlang533@gmail.com')
-                        : 'Chưa có phiên Google Account'}
+                        ? (formData.googleAccountEmail || 'Tài khoản Google Cá Nhân')
+                        : 'Chưa nạp Cookie Google Account'}
                     </span>
                     {formData.googleAccountConnected && (
                       <span className="text-[9px] bg-sky-950 text-sky-300 px-1.5 py-0.2 rounded border border-sky-800 font-mono">
@@ -990,50 +1155,38 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
                   </div>
                   <p className="text-[10px] text-slate-400">
                     {formData.googleAccountConnected
-                      ? `Token Session: ${formData.geminiWebSessionToken ? formData.geminiWebSessionToken.slice(0, 18) + '...' : 'SNlM0e_live_ready'}`
-                      : 'Kết nối tài khoản Google để dịch không giới hạn qua WebView ẩn'}
+                      ? `Mã bảo mật SNlM0e: ${formData.geminiWebSessionToken ? formData.geminiWebSessionToken.slice(0, 16) + '...' : 'Đã bắt tay thành công'}`
+                      : 'Sử dụng trực tiếp session của bạn để dịch phụ đề không giới hạn quota'}
                   </p>
                 </div>
               </div>
 
               {/* Action Buttons Group */}
               <div className="flex items-center gap-2 w-full sm:w-auto">
-                {!formData.googleAccountConnected ? (
+                <button
+                  type="button"
+                  onClick={() => handleCheckGoogleToken()}
+                  disabled={isCheckingGoogleToken || !formData.geminiWebCookie?.trim()}
+                  className="flex-1 sm:flex-initial px-3 py-1.5 bg-gradient-to-r from-sky-600 to-blue-600 hover:from-sky-500 hover:to-blue-500 text-white font-bold text-xs rounded-xl shadow-md flex items-center justify-center gap-1.5 transition cursor-pointer disabled:opacity-50"
+                  title="Gửi handshake tới Google để kiểm tra và lấy mã SNlM0e"
+                >
+                  {isCheckingGoogleToken ? (
+                    <Loader2 className="w-3.5 h-3.5 animate-spin text-white" />
+                  ) : (
+                    <RefreshCw className="w-3.5 h-3.5 text-white" />
+                  )}
+                  <span>Xác Thực Cookie (checkToken)</span>
+                </button>
+                {formData.googleAccountConnected && (
                   <button
                     type="button"
-                    onClick={handleGoogleQuickLogin}
-                    disabled={isCheckingGoogleToken}
-                    className="flex-1 sm:flex-initial px-3 py-1.5 bg-gradient-to-r from-sky-600 to-blue-600 hover:from-sky-500 hover:to-blue-500 text-white font-bold text-xs rounded-xl shadow-md flex items-center justify-center gap-1.5 transition cursor-pointer disabled:opacity-50"
+                    onClick={handleGoogleLogout}
+                    className="px-2.5 py-1.5 bg-rose-950/40 hover:bg-rose-900/60 text-rose-300 border border-rose-800/60 text-xs font-medium rounded-xl flex items-center gap-1 transition cursor-pointer"
+                    title="Xóa cookie và đăng xuất"
                   >
-                    <LogIn className="w-3.5 h-3.5" />
-                    <span>Đăng Nhập Google</span>
+                    <LogOut className="w-3.5 h-3.5" />
+                    <span>Xóa Phiên</span>
                   </button>
-                ) : (
-                  <>
-                    <button
-                      type="button"
-                      onClick={() => handleCheckGoogleToken()}
-                      disabled={isCheckingGoogleToken}
-                      className="px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-600 text-xs font-medium rounded-xl flex items-center gap-1 transition cursor-pointer disabled:opacity-50"
-                      title="Kiểm tra token phiên làm việc"
-                    >
-                      {isCheckingGoogleToken ? (
-                        <Loader2 className="w-3.5 h-3.5 animate-spin text-sky-400" />
-                      ) : (
-                        <RefreshCw className="w-3.5 h-3.5 text-sky-400" />
-                      )}
-                      <span>checkToken</span>
-                    </button>
-                    <button
-                      type="button"
-                      onClick={handleGoogleLogout}
-                      className="px-2.5 py-1.5 bg-rose-950/40 hover:bg-rose-900/60 text-rose-300 border border-rose-800/60 text-xs font-medium rounded-xl flex items-center gap-1 transition cursor-pointer"
-                      title="Đăng xuất khỏi phiên Google"
-                    >
-                      <LogOut className="w-3.5 h-3.5" />
-                      <span>Đăng Xuất</span>
-                    </button>
-                  </>
                 )}
               </div>
             </div>
@@ -1056,60 +1209,79 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
               </div>
             )}
 
-            {/* Architecture Explanation Card (BachTranslate WebView Rationale) */}
+            {/* Cookie Input Area */}
+            <div className="space-y-2 p-3 bg-slate-950 border border-slate-800 rounded-xl shadow-inner">
+              <label className="block text-xs font-bold text-slate-200 flex items-center justify-between">
+                <span className="flex items-center gap-1.5 text-sky-300">
+                  <Key className="w-3.5 h-3.5" />
+                  <span>Google Cookie Session (__Secure-1PSID / __Secure-1PSIDTS):</span>
+                </span>
+                <span className="text-[10px] text-slate-400 font-normal">Bắt buộc cho Mode 3</span>
+              </label>
+              <textarea
+                rows={3}
+                placeholder="Dán giá trị __Secure-1PSID hoặc toàn bộ chuỗi Cookie từ https://gemini.google.com vào đây..."
+                value={formData.geminiWebCookie || ''}
+                onChange={(e) => handleChange('geminiWebCookie', e.target.value)}
+                className="w-full bg-slate-900 border border-slate-700 rounded-lg p-2.5 text-[11px] font-mono text-slate-200 focus:outline-none focus:border-sky-400 shadow-inner"
+              />
+              <div className="flex items-center justify-between text-[10.5px] text-slate-400">
+                <span>✦ Mẹo: Nhấn F12 trên trang gemini.google.com &gt; tab Application &gt; Cookies &gt; copy giá trị của <strong className="text-sky-300 font-mono">__Secure-1PSID</strong>.</span>
+                <button
+                  type="button"
+                  onClick={() => handleCheckGoogleToken(formData.geminiWebCookie)}
+                  disabled={isCheckingGoogleToken || !formData.geminiWebCookie?.trim()}
+                  className="px-3 py-1 bg-sky-700 hover:bg-sky-600 text-white font-bold text-[11px] rounded-lg transition cursor-pointer disabled:opacity-50"
+                >
+                  Lưu & Xác Thực Ngay
+                </button>
+              </div>
+            </div>
+
+            {/* How Mode 3 Works */}
             <div className="bg-slate-950/60 border border-slate-800 rounded-xl p-3 space-y-2 text-[11px] text-slate-300 leading-relaxed">
               <div className="flex items-center gap-1.5 text-xs font-bold text-sky-300">
                 <Info className="w-4 h-4 text-sky-400 shrink-0" />
-                <span>Tại sao BachTranslate sử dụng WebView ẩn?</span>
+                <span>Quy trình hoạt động Mode 3 (Gemini Web RPC):</span>
               </div>
-              <p className="text-slate-300">
-                Mục đích của WebView này <strong className="text-white">không phải để hiển thị trang Gemini cho bạn xem và tự chat tay</strong> — mà để ứng dụng tự động hoá hoàn toàn quy trình:
-              </p>
-              <div className="grid grid-cols-1 sm:grid-cols-4 gap-2 pt-1">
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 pt-1">
                 <div className="bg-slate-900/80 p-2 rounded-lg border border-slate-800 flex flex-col gap-1">
-                  <span className="text-[10px] font-bold text-sky-400">1. Load Ngầm</span>
-                  <span className="text-[10px] text-slate-400">Khởi tạo WebView tải trang gemini.google.com trong background.</span>
+                  <span className="text-[10px] font-bold text-sky-400">1. Xác Thực Cookie</span>
+                  <span className="text-[10px] text-slate-400">Hệ thống gửi handshake tới gemini.google.com để trích xuất token bảo mật SNlM0e.</span>
                 </div>
                 <div className="bg-slate-900/80 p-2 rounded-lg border border-slate-800 flex flex-col gap-1">
-                  <span className="text-[10px] font-bold text-sky-400">2. Đọc Cookie</span>
-                  <span className="text-[10px] text-slate-400">Đọc cookie Google Account đã lưu để bắt tay xác thực session (Token ready).</span>
+                  <span className="text-[10px] font-bold text-sky-400">2. Gửi RPC Stream</span>
+                  <span className="text-[10px] text-slate-400">Mỗi đợt dịch phụ đề gửi trực tiếp qua API nội bộ BardFrontendService/StreamGenerate.</span>
                 </div>
                 <div className="bg-slate-900/80 p-2 rounded-lg border border-slate-800 flex flex-col gap-1">
-                  <span className="text-[10px] font-bold text-sky-400">3. Bơm JavaScript</span>
-                  <span className="text-[10px] text-slate-400">Tự động bơm script evaluateJavascript để gõ prompt và trigger gửi ngầm.</span>
-                </div>
-                <div className="bg-slate-900/80 p-2 rounded-lg border border-slate-800 flex flex-col gap-1">
-                  <span className="text-[10px] font-bold text-sky-400">4. Parse DOM & Dịch</span>
-                  <span className="text-[10px] text-slate-400">Đọc kết quả từ DOM mã nguồn, lọc dedup và trả về phụ đề chuẩn sạch.</span>
+                  <span className="text-[10px] font-bold text-sky-400">3. 0đ Tiêu Hao Quota</span>
+                  <span className="text-[10px] text-slate-400">Tận dụng trọn vẹn sức mạnh dịch thuật của Gemini Web mà không chạm vào API Key.</span>
                 </div>
               </div>
-              <p className="text-[10px] text-slate-400 italic pt-1">
-                ✦ Nhờ chạy ẩn, màn hình không bị nhấp nháy chuyển trang liên tục — người dùng luôn được trải nghiệm giao diện dịch phụ đề mượt mà và sạch sẽ.
-              </p>
             </div>
 
-            {/* Test Prompt Injection & Live Automation Trigger */}
+            {/* Test Prompt Trigger */}
             <div className="bg-slate-950/80 border border-slate-800/80 rounded-xl p-3 space-y-2">
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-1.5 text-xs font-bold text-slate-200">
                   <Code2 className="w-3.5 h-3.5 text-amber-400" />
-                  <span>Thử Nghiệm Bơm Script Dịch (evaluateJavascript Test)</span>
+                  <span>Thử Nghiệm Gửi Câu Lệnh Dịch Qua RPC (Test Prompt)</span>
                 </div>
                 <button
                   type="button"
                   onClick={handleTestGeminiPrompt}
-                  disabled={isTestingGeminiPrompt}
+                  disabled={isTestingGeminiPrompt || !formData.geminiWebCookie?.trim()}
                   className="px-3 py-1 bg-amber-600/30 hover:bg-amber-600/50 border border-amber-500/50 rounded-lg text-[11px] font-bold text-amber-200 flex items-center gap-1.5 transition cursor-pointer disabled:opacity-50"
                 >
                   {isTestingGeminiPrompt ? (
                     <>
                       <Loader2 className="w-3.5 h-3.5 animate-spin text-amber-300" />
-                      <span>Đang Bơm Script...</span>
+                      <span>Đang Gửi RPC...</span>
                     </>
                   ) : (
                     <>
                       <Play className="w-3.5 h-3.5 fill-amber-300 text-amber-300" />
-                      <span>Chạy Thử Nghiệm Prompt</span>
+                      <span>Chạy Thử Nghiệm RPC</span>
                     </>
                   )}
                 </button>
@@ -1119,82 +1291,9 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
                 <div className="mt-2 bg-slate-900 border border-slate-700/80 rounded-lg p-2.5 font-mono text-[11px] text-emerald-300 whitespace-pre-wrap shadow-inner">
                   <div className="text-[10px] text-slate-400 font-sans font-bold pb-1 flex items-center gap-1">
                     <CheckCircle2 className="w-3 h-3 text-emerald-400" />
-                    <span>Kết quả trích xuất từ DOM trang Gemini Web:</span>
+                    <span>Kết quả dịch nhận được từ Google Gemini Web RPC:</span>
                   </div>
                   {testPromptResult}
-                </div>
-              )}
-            </div>
-
-            {/* Advanced WebView Settings (Tùy chọn nâng cao) */}
-            <div className="pt-2 border-t border-metallic space-y-3">
-              <div className="flex items-center justify-between text-xs font-bold text-slate-200">
-                <div className="flex items-center gap-1.5">
-                  <SlidersHorizontal className="w-3.5 h-3.5 text-slate-300" />
-                  <span>Tùy Chọn WebView Nâng Cao</span>
-                </div>
-                <button
-                  type="button"
-                  onClick={() => setShowCookieInput(!showCookieInput)}
-                  className="text-[11px] text-sky-400 hover:text-sky-300 underline cursor-pointer"
-                >
-                  {showCookieInput ? 'Ẩn ô Cookie' : 'Nhập Cookie thủ công (Tùy chọn)'}
-                </button>
-              </div>
-
-              {/* Toggles */}
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                <label className="flex items-center justify-between p-2.5 bg-slate-950/60 border border-slate-800 rounded-xl cursor-pointer hover:border-slate-700 transition">
-                  <div className="space-y-0.5">
-                    <span className="text-xs font-bold text-slate-200 block">WebView Chạy Ẩn (Headless)</span>
-                    <span className="text-[10px] text-slate-400 block">Ẩn hoàn toàn cửa sổ nền</span>
-                  </div>
-                  <input
-                    type="checkbox"
-                    checked={formData.geminiWebHeadlessMode ?? true}
-                    onChange={(e) => handleChange('geminiWebHeadlessMode', e.target.checked)}
-                    className="w-4 h-4 accent-sky-500 rounded cursor-pointer"
-                  />
-                </label>
-
-                <label className="flex items-center justify-between p-2.5 bg-slate-950/60 border border-slate-800 rounded-xl cursor-pointer hover:border-slate-700 transition">
-                  <div className="space-y-0.5">
-                    <span className="text-xs font-bold text-slate-200 block">Duy Trì Phiên Nền (Keep-Alive)</span>
-                    <span className="text-[10px] text-slate-400 block">Giữ session để dịch tức thì</span>
-                  </div>
-                  <input
-                    type="checkbox"
-                    checked={formData.geminiWebKeepAlive ?? true}
-                    onChange={(e) => handleChange('geminiWebKeepAlive', e.target.checked)}
-                    className="w-4 h-4 accent-sky-500 rounded cursor-pointer"
-                  />
-                </label>
-              </div>
-
-              {/* Manual Cookie Input Area */}
-              {showCookieInput && (
-                <div className="space-y-1.5 p-3 bg-slate-950 border border-slate-800 rounded-xl animate-fade-in shadow-inner">
-                  <label className="block text-[11px] font-semibold text-slate-200 flex items-center justify-between">
-                    <span>Google Session Cookie (__Secure-1PSID / __Secure-1PSIDTS / SAPISID):</span>
-                    <span className="text-[10px] text-slate-400">Copy từ DevTools trình duyệt</span>
-                  </label>
-                  <textarea
-                    rows={2}
-                    placeholder="Dán chuỗi Cookie từ gemini.google.com nếu muốn chỉ định phiên riêng..."
-                    value={formData.geminiWebCookie || ''}
-                    onChange={(e) => handleChange('geminiWebCookie', e.target.value)}
-                    className="w-full bg-slate-900 border border-slate-700 rounded-lg p-2 text-[11px] font-mono text-slate-200 focus:outline-none focus:border-sky-400 shadow-inner"
-                  />
-                  <div className="flex justify-end gap-2 pt-1">
-                    <button
-                      type="button"
-                      onClick={() => handleCheckGoogleToken(formData.geminiWebCookie)}
-                      disabled={isCheckingGoogleToken || !formData.geminiWebCookie?.trim()}
-                      className="px-3 py-1 bg-sky-700 hover:bg-sky-600 text-white font-bold text-[11px] rounded-lg transition cursor-pointer disabled:opacity-50"
-                    >
-                      Lưu & Kiểm Tra Cookie
-                    </button>
-                  </div>
                 </div>
               )}
             </div>
@@ -1204,7 +1303,7 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
               <div className="flex items-center justify-between">
                 <label className="text-xs font-bold text-slate-300 flex items-center gap-1.5">
                   <Terminal className="w-3.5 h-3.5 text-emerald-400" />
-                  <span>Terminal Tự Động Hóa WebView Ẩn (Console Log):</span>
+                  <span>Terminal Kết Nối Google Gemini Web (Console Log):</span>
                 </label>
                 <button
                   type="button"
@@ -1218,13 +1317,13 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
               <div className="bg-[#0b0f19] border border-slate-800 rounded-xl p-2.5 font-mono text-[10.5px] leading-relaxed max-h-36 overflow-y-auto space-y-1 shadow-inner select-text">
                 {googleLogs.map((log, index) => {
                   let colorClass = 'text-slate-300';
-                  if (log.includes('Token ready') || log.includes('thành công') || log.includes('sẵn sàng')) {
+                  if (log.includes('Token ready') || log.includes('thành công') || log.includes('sẵn sàng') || log.includes('SNlM0e')) {
                     colorClass = 'text-emerald-400 font-bold';
-                  } else if (log.includes('checkToken') || log.includes('Navigating') || log.includes('Handshake')) {
+                  } else if (log.includes('checkToken') || log.includes('GeminiWeb') || log.includes('bắt tay')) {
                     colorClass = 'text-sky-300';
-                  } else if (log.includes('evaluateJavascript') || log.includes('executeJsFetch')) {
+                  } else if (log.includes('RPC') || log.includes('Prompt')) {
                     colorClass = 'text-amber-300';
-                  } else if (log.includes('Error') || log.includes('missing') || log.includes('Lỗi')) {
+                  } else if (log.includes('Error') || log.includes('missing') || log.includes('Lỗi') || log.includes('Failed')) {
                     colorClass = 'text-rose-400';
                   }
                   return (

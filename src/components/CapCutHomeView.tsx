@@ -29,11 +29,15 @@ import {
   ChevronUp,
   ChevronDown,
   FileVideo,
+  Crown,
+  KeyRound,
+  ShieldAlert,
 } from 'lucide-react';
 import { Project, GeminiModelOption, AppSettings, VideoClip } from '../types';
 import { storeMediaFileDB } from '../utils/idbStorage';
 import { ConfigView } from './ConfigView';
 import { MultiPlatformDownloaderView } from './MultiPlatformDownloaderView';
+import { LicenseState } from '../utils/licenseManager';
 
 interface CapCutHomeViewProps {
   projects: Project[];
@@ -46,6 +50,8 @@ interface CapCutHomeViewProps {
   appSettings: AppSettings;
   onSaveSettings: (newSettings: AppSettings) => void;
   initialTab?: 'home' | 'editor' | 'config' | 'downloader';
+  licenseState?: LicenseState | null;
+  onOpenLicense?: () => void;
 }
 
 export const CapCutHomeView: React.FC<CapCutHomeViewProps> = ({
@@ -59,6 +65,8 @@ export const CapCutHomeView: React.FC<CapCutHomeViewProps> = ({
   appSettings,
   onSaveSettings,
   initialTab = 'home',
+  licenseState,
+  onOpenLicense,
 }) => {
   const [activeTab, setActiveTab] = useState<'home' | 'editor' | 'config' | 'downloader'>(initialTab);
   const [showImportModal, setShowImportModal] = useState<boolean>(false);
@@ -137,7 +145,7 @@ export const CapCutHomeView: React.FC<CapCutHomeViewProps> = ({
       const file = selectedFiles[0];
       const title = file.name.replace(/\.[^/.]+$/, '');
       const url = URL.createObjectURL(file);
-      onCreateNewProject(url, title, undefined, file);
+      await onCreateNewProject(url, title, undefined, file);
       setShowImportModal(false);
       setSelectedFiles([]);
       return;
@@ -148,6 +156,7 @@ export const CapCutHomeView: React.FC<CapCutHomeViewProps> = ({
 
     try {
       console.log('[CapCutHomeView] Processing selected files client-side...');
+      const projTimestamp = Date.now();
       const clips = await Promise.all(
         selectedFiles.map(async (file, index) => {
           const url = URL.createObjectURL(file);
@@ -164,7 +173,7 @@ export const CapCutHomeView: React.FC<CapCutHomeViewProps> = ({
           });
 
           // Store file in IndexedDB under a custom clip ID
-          const clipId = `clip-${Date.now()}-${index}`;
+          const clipId = `clip-${projTimestamp}-${index}`;
           const storedUrl = await storeMediaFileDB(clipId, file);
 
           return {
@@ -190,7 +199,7 @@ export const CapCutHomeView: React.FC<CapCutHomeViewProps> = ({
 
       const mainUrl = validClips[0].url;
 
-      onCreateNewProject(mainUrl, defaultTitle, undefined, undefined, validClips);
+      await onCreateNewProject(mainUrl, defaultTitle, undefined, undefined, validClips);
       setShowImportModal(false);
       setSelectedFiles([]);
     } catch (err: any) {
@@ -206,7 +215,7 @@ export const CapCutHomeView: React.FC<CapCutHomeViewProps> = ({
     if (file) {
       const title = file.name.replace(/\.[^/.]+$/, '');
       const url = URL.createObjectURL(file);
-      onCreateNewProject(url, title, undefined, file);
+      await onCreateNewProject(url, title, undefined, file);
       setShowImportModal(false);
     }
   };
@@ -289,8 +298,8 @@ export const CapCutHomeView: React.FC<CapCutHomeViewProps> = ({
       {/* Smartphone / PC Responsive Container Viewport */}
       <div className="w-full max-w-md md:max-w-2xl lg:max-w-3xl bg-[#121215] min-h-screen flex flex-col relative shadow-2xl border-x border-slate-900/80 transition-all duration-300">
         
-        {/* Top Header - Icon & BachTranslate Logo Only */}
-        <header className="px-4 py-3 bg-metallic-panel flex items-center sticky top-0 z-30 border-b border-slate-700/60 shadow-md">
+        {/* Top Header - Icon & BachTranslate Logo + License Badge */}
+        <header className="px-4 py-3 bg-metallic-panel flex items-center justify-between sticky top-0 z-30 border-b border-slate-700/60 shadow-md">
           {/* Logo Left */}
           <div className="flex items-center space-x-2 cursor-pointer" onClick={() => setActiveTab('home')}>
             <div className="w-7 h-7 rounded-lg bg-gradient-to-tr from-slate-600 via-slate-300 to-slate-100 p-1 flex items-center justify-center shadow-md shadow-slate-300/20 border border-white/30">
@@ -300,6 +309,18 @@ export const CapCutHomeView: React.FC<CapCutHomeViewProps> = ({
               BachTranslate
             </h1>
           </div>
+
+          {/* Admin Control Panel Button (Only visible for Super Admin Tien Ly) */}
+          {onOpenLicense && licenseState?.isAdmin && (
+            <button
+              onClick={onOpenLicense}
+              className="flex items-center space-x-1.5 px-3 py-1.5 rounded-xl text-xs font-black transition-all shadow-md active:scale-95 cursor-pointer bg-gradient-to-r from-amber-400 via-yellow-300 to-amber-500 text-slate-950 shadow-amber-500/20 hover:brightness-110"
+              title="Trung Tâm Quản Trị Super Admin & Buff VIP (Chỉ Dành Cho Admin)"
+            >
+              <Crown className="w-3.5 h-3.5 fill-slate-950" />
+              <span>👑 ADMIN BUFF VIP</span>
+            </button>
+          )}
         </header>
 
         {/* Main Content Area */}
@@ -310,6 +331,7 @@ export const CapCutHomeView: React.FC<CapCutHomeViewProps> = ({
             <ConfigView
               settings={appSettings}
               onSaveSettings={onSaveSettings}
+              onOpenLicense={onOpenLicense}
             />
           ) : activeTab === 'downloader' ? (
             /* VIEW SWITCHER: MULTI-PLATFORM DOWNLOADER VIEW */

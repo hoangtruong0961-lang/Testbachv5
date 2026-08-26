@@ -301,6 +301,7 @@ export async function saveSettingsToDB(settings: AppSettings, existingDb?: IDBDa
  * Store Media / Video File directly in IDB (supports large video files)
  */
 export async function storeMediaFileDB(id: string, file: File | Blob): Promise<string> {
+  if (!id || !file) return '';
   try {
     const db = await openDatabase();
     return new Promise((resolve, reject) => {
@@ -309,13 +310,14 @@ export async function storeMediaFileDB(id: string, file: File | Blob): Promise<s
       const req = store.put({
         id,
         file,
-        type: file.type,
+        type: file.type || 'video/mp4',
         name: (file as File).name || 'video',
         createdAt: Date.now(),
       });
 
       req.onsuccess = () => {
         const objectUrl = URL.createObjectURL(file);
+        console.log(`[IndexedDB] Stored media blob successfully for ${id} (size: ${(file.size / 1024 / 1024).toFixed(2)} MB)`);
         resolve(objectUrl);
       };
       req.onerror = () => reject(req.error);
@@ -330,6 +332,7 @@ export async function storeMediaFileDB(id: string, file: File | Blob): Promise<s
  * Get Media / Video object URL from IDB
  */
 export async function getMediaFileUrlDB(id: string): Promise<string | null> {
+  if (!id) return null;
   try {
     const db = await openDatabase();
     return new Promise((resolve, reject) => {
@@ -339,7 +342,8 @@ export async function getMediaFileUrlDB(id: string): Promise<string | null> {
 
       req.onsuccess = () => {
         if (req.result && req.result.file) {
-          const url = URL.createObjectURL(req.result.file);
+          const fileBlob = req.result.file;
+          const url = URL.createObjectURL(fileBlob);
           resolve(url);
         } else {
           resolve(null);

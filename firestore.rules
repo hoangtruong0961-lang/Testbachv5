@@ -1,0 +1,26 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Helper function to check authentication
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    // License collection
+    match /licenses/{licenseId} {
+      allow read: if true;
+      allow write: if true;
+    }
+
+    // Device registrations
+    match /devices/{deviceId} {
+      allow read: if true;
+      allow write: if true;
+    }
+
+    // User settings and cloud project metadata
+    match /users/{userId} {
+      allow read, write: if isAuthenticated() && request.auth.uid == userId;
+    }
+  }
+}

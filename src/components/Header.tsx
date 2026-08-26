@@ -1,7 +1,8 @@
 import React from 'react';
-import { Star, Video, Sparkles, Languages, Cpu, Download, Film, HelpCircle } from 'lucide-react';
+import { Star, Video, Sparkles, Languages, Cpu, Download, Film, HelpCircle, Crown, KeyRound } from 'lucide-react';
 import { GeminiModelOption } from '../types';
 import { SUPPORTED_LANGUAGES } from '../data/sampleVideos';
+import { LicenseState } from '../utils/licenseManager';
 
 interface HeaderProps {
   selectedModel: GeminiModelOption;
@@ -12,6 +13,8 @@ interface HeaderProps {
   onOpenExport: () => void;
   onOpenHelp: () => void;
   subtitleCount: number;
+  licenseState?: LicenseState | null;
+  onOpenLicense?: () => void;
 }
 
 export const Header: React.FC<HeaderProps> = ({
@@ -23,6 +26,8 @@ export const Header: React.FC<HeaderProps> = ({
   onOpenExport,
   onOpenHelp,
   subtitleCount,
+  licenseState,
+  onOpenLicense,
 }) => {
   return (
     <header className="bg-metallic-panel border-b border-slate-700/60 text-slate-100 sticky top-0 z-40 shadow-xl">
@@ -86,6 +91,38 @@ export const Header: React.FC<HeaderProps> = ({
               ))}
             </select>
           </div>
+
+          {/* License Button / VIP Badge */}
+          {onOpenLicense && (
+            <button
+              onClick={onOpenLicense}
+              className={`flex items-center space-x-1.5 text-xs font-black px-3 py-1.5 rounded-xl transition shadow-md ${
+                licenseState?.isAdmin
+                  ? 'bg-gradient-to-r from-amber-400 to-yellow-300 text-slate-950 hover:brightness-110'
+                  : licenseState?.isPro
+                  ? 'bg-gradient-to-r from-sky-400 to-indigo-400 text-slate-950 hover:brightness-110'
+                  : 'btn-metallic-dark text-amber-300 border border-amber-500/30'
+              }`}
+              title={licenseState?.isAdmin ? 'Tài khoản Super Admin VIP (Vô hạn)' : 'Bản quyền & Kích hoạt'}
+            >
+              {licenseState?.isAdmin ? (
+                <>
+                  <Crown className="w-3.5 h-3.5 fill-slate-950" />
+                  <span>ADMIN VIP</span>
+                </>
+              ) : licenseState?.isPro ? (
+                <>
+                  <Crown className="w-3.5 h-3.5 fill-slate-950" />
+                  <span>PRO VIP</span>
+                </>
+              ) : (
+                <>
+                  <KeyRound className="w-3.5 h-3.5 text-amber-400" />
+                  <span>Bản Quyền</span>
+                </>
+              )}
+            </button>
+          )}
 
           {/* Sample Videos Button */}
           <button

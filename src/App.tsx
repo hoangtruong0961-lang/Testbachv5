@@ -2,10 +2,12 @@ import React, { useState, useEffect } from 'react';
 import { CapCutHomeView } from './components/CapCutHomeView';
 import { CapCutEditorView } from './components/CapCutEditorView';
 import { HelpModal } from './components/HelpModal';
+import { LicenseModal } from './components/LicenseModal';
 import { Project, GeminiModelOption, RegionROI, AppSettings, VideoClip } from './types';
 import { getSavedProjects, saveProject, deleteProject } from './utils/projectStorage';
 import { getAppSettings, saveAppSettings } from './utils/settingsStorage';
 import { initStorageDB, getAllProjectsFromDB, storeMediaFileDB, getMediaFileUrlDB, cacheRemoteVideoToDB, deleteProjectFromDB } from './utils/idbStorage';
+import { getCurrentLicenseState, ensureAndSyncDeviceLicense, subscribeLicenseState, syncVerifyLicense, LicenseState } from './utils/licenseManager';
 
 export default function App() {
   const [currentView, setCurrentView] = useState<'home' | 'editor'>('home');
@@ -14,6 +16,8 @@ export default function App() {
   const [appSettings, setAppSettings] = useState<AppSettings>(() => getAppSettings());
   const [selectedModel, setSelectedModel] = useState<GeminiModelOption>(appSettings.selectedModel);
   const [isHelpOpen, setIsHelpOpen] = useState<boolean>(false);
+  const [isLicenseOpen, setIsLicenseOpen] = useState<boolean>(false);
+  const [licenseState, setLicenseState] = useState<LicenseState | null>(null);
 
   // Helper to restore video URLs from IndexedDB for projects where object URLs are expired or missing
   const restoreProjectVideoUrls = async (projList: Project[]): Promise<Project[]> => {
@@ -33,7 +37,7 @@ export default function App() {
         }
 
         let mainUrl = p.videoUrl;
-        if (updatedClips && updatedClips.length > 0) {
+        if (updatedClips && updatedClips.length > 0 && updatedClips[0].url) {
           mainUrl = updatedClips[0].url;
         } else {
           // Check IndexedDB first for permanent offline video
@@ -50,7 +54,13 @@ export default function App() {
 
   // Initialize IndexedDB and load saved projects & settings on initial render
   useEffect(() => {
+    // Initialize & auto-ensure/sync License State with server
+    getCurrentLicenseState().then((st) => setLicenseState(st));
+    const unsubscribeLicense = subscribeLicenseState((st) => setLicenseState(st));
+    ensureAndSyncDeviceLicense().then((st) => setLicenseState(st)).catch(() => {});
+
     initStorageDB().then(async ({ projects: dbProjects, settings: dbSettings }) => {
+      console.log('[App] initStorageDB loaded projects count:', dbProjects?.length);
       const restored = await restoreProjectVideoUrls(dbProjects);
       setProjects(restored);
       if (dbSettings) {
@@ -63,6 +73,10 @@ export default function App() {
       const restored = await restoreProjectVideoUrls(saved);
       setProjects(restored);
     });
+
+    return () => {
+      unsubscribeLicense();
+    };
   }, []);
 
   const handleSaveSettings = (newSettings: AppSettings) => {
@@ -81,7 +95,8 @@ export default function App() {
   // Open existing project
   const handleOpenProject = async (project: Project) => {
     const restoredList = await restoreProjectVideoUrls([project]);
-    setActiveProject(restoredList[0]);
+    const restoredProj = restoredList[0] || project;
+    setActiveProject(restoredProj);
     setCurrentView('editor');
   };
 
@@ -97,6 +112,7 @@ export default function App() {
     let finalUrl = videoUrl;
 
     if (videoFile) {
+      console.log(`[App] Storing uploaded video file to IndexedDB for project ${projId}...`);
       const storedUrl = await storeMediaFileDB(projId, videoFile);
       if (storedUrl) finalUrl = storedUrl;
     } else if (finalUrl && !finalUrl.startsWith('blob:') && !finalUrl.startsWith('data:')) {
@@ -149,7 +165,7 @@ export default function App() {
 
     saveProject(newProj);
     const updatedList = await getAllProjectsFromDB();
-    const listToRestore = updatedList && updatedList.length > 0 ? updatedList : getSavedProjects();
+    const listToRestore = updatedList && updatedList.length > 0 ? updatedList : [newProj, ...projects];
     const restored = await restoreProjectVideoUrls(listToRestore);
     setProjects(restored);
 
@@ -199,6 +215,8 @@ export default function App() {
           onOpenHelp={() => setIsHelpOpen(true)}
           appSettings={appSettings}
           onSaveSettings={handleSaveSettings}
+          licenseState={licenseState}
+          onOpenLicense={() => setIsLicenseOpen(true)}
         />
       ) : (
         <CapCutEditorView
@@ -216,10 +234,13 @@ export default function App() {
           onSelectModel={handleSelectModel}
           appSettings={appSettings}
           onSaveSettings={handleSaveSettings}
+          licenseState={licenseState}
+          onOpenLicense={() => setIsLicenseOpen(true)}
         />
       )}
 
       <HelpModal isOpen={isHelpOpen} onClose={() => setIsHelpOpen(false)} />
+      <LicenseModal isOpen={isLicenseOpen} onClose={() => setIsLicenseOpen(false)} />
     </>
   );
 }

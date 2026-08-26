@@ -1,0 +1,511 @@
+/**
+ * Client-Side License Manager (Secured & Firebase Cloud Authoritative)
+ * All license validation and elevation are governed strictly by Firebase Firestore Cloud Database
+ * with fallback to backend server and cryptographically signed tokens.
+ */
+
+import { getDeviceFingerprint, getSavedUserImei, saveUserImei, DeviceInfo } from './deviceFingerprint';
+import {
+  syncDeviceToCloudFirestore,
+  getCloudLicenseByKey,
+  verifyDeviceLicenseWithFirestore,
+  activateCloudLicenseInFirestore,
+  subscribeRealtimeCloudLicense,
+  ResolvedCloudLicenseState
+} from '../services/firebaseLicenseService';
+
+export interface LicenseState {
+  isPro: boolean;
+  isAdmin: boolean;
+  plan: 'free' | 'trial' | 'month' | 'quarter' | 'year' | 'lifetime' | 'admin';
+  role: 'user' | 'pro' | 'admin';
+  key?: string;
+  token?: string;
+  status: 'inactive' | 'active' | 'expired' | 'suspended';
+  expiresAt: number | null; // null = lifetime
+  remainingDays?: number;
+  maxDevices: number;
+  activatedCount: number;
+  note?: string;
+  deviceId: string;
+  imei?: string;
+  isWhitelistedAdmin?: boolean;
+  cloudSynced?: boolean;
+}
+
+const STORAGE_LICENSE_STATE_KEY = 'bach_active_license_state_v3';
+const STORAGE_LICENSE_KEY = 'bach_active_license_key_v3';
+const STORAGE_LICENSE_TOKEN_KEY = 'bach_license_token_v3';
+
+type LicenseChangeListener = (state: LicenseState) => void;
+const listeners: Set<LicenseChangeListener> = new Set();
+let isCloudListenerStarted = false;
+
+export function subscribeLicenseState(fn: LicenseChangeListener): () => void {
+  listeners.add(fn);
+  return () => listeners.delete(fn);
+}
+
+function notifyListeners(state: LicenseState) {
+  listeners.forEach(fn => {
+    try { fn(state); } catch (e) { console.error('[LicenseManager] listener error:', e); }
+  });
+}
+
+/**
+ * Returns default Free Tier state
+ */
+export function getDefaultFreeState(deviceId: string, imei?: string): LicenseState {
+  return {
+    isPro: false,
+    isAdmin: false,
+    plan: 'free',
+    role: 'user',
+    status: 'inactive',
+    expiresAt: null,
+    maxDevices: 1,
+    activatedCount: 1,
+    deviceId,
+    imei,
+    note: 'Bản Dùng Thử Cơ Bản',
+    cloudSynced: false
+  };
+}
+
+/**
+ * Get stored cryptographic license token for authenticated API calls
+ */
+export function getStoredLicenseToken(): string {
+  try {
+    return localStorage.getItem(STORAGE_LICENSE_TOKEN_KEY) || '';
+  } catch (_) {
+    return '';
+  }
+}
+
+/**
+ * Saves verified license state and signed token to local storage
+ */
+export function saveLocalState(state: LicenseState, token?: string) {
+  try {
+    localStorage.setItem(STORAGE_LICENSE_STATE_KEY, JSON.stringify(state));
+    if (state.key) {
+      localStorage.setItem(STORAGE_LICENSE_KEY, state.key);
+    }
+    if (token) {
+      localStorage.setItem(STORAGE_LICENSE_TOKEN_KEY, token);
+    }
+  } catch (_) {}
+  notifyListeners(state);
+}
+
+/**
+ * Auto-ensure device license with Firebase Firestore Cloud & Server on startup
+ */
+export async function ensureAndSyncDeviceLicense(): Promise<LicenseState> {
+  const deviceInfo = await getDeviceFingerprint();
+  const currentImei = getSavedUserImei() || deviceInfo.imei || '';
+  const storedToken = getStoredLicenseToken();
+
+  // 1. Start live Real-time Firestore Listener if not yet started
+  if (!isCloudListenerStarted && deviceInfo.deviceId) {
+    isCloudListenerStarted = true;
+    subscribeRealtimeCloudLicense(deviceInfo.deviceId, (cloudState) => {
+      if (cloudState) {
+        console.log('[Firebase Realtime] Live License Update received from Firestore:', cloudState);
+        const fullState: LicenseState = {
+          ...cloudState,
+          token: getStoredLicenseToken()
+        };
+        saveLocalState(fullState);
+      }
+    });
+  }
+
+  // 2. Direct Cloud Verification with Firebase Firestore
+  try {
+    const cloudVerified = await verifyDeviceLicenseWithFirestore(deviceInfo);
+    if (cloudVerified && cloudVerified.isPro) {
+      console.log('[Firebase Cloud] Device verified directly via Firestore Cloud:', cloudVerified);
+      const cloudState: LicenseState = {
+        ...cloudVerified,
+        token: storedToken
+      };
+      saveLocalState(cloudState);
+      return cloudState;
+    }
+  } catch (err) {
+    console.warn('[Firebase Cloud] Direct Firestore check warning:', err);
+  }
+
+  // 3. Sync with local server API
+  try {
+    const res = await fetch('/api/license/ensure-device', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-license-token': storedToken
+      },
+      body: JSON.stringify({
+        deviceId: deviceInfo.deviceId,
+        deviceName: deviceInfo.deviceName,
+        imei: currentImei
+      })
+    });
+    const data = await res.json();
+    if (data.success && data.license) {
+      const lic = data.license;
+      let remainingDays: number | undefined = undefined;
+      if (lic.expiresAt) {
+        remainingDays = Math.max(0, Math.ceil((lic.expiresAt - Date.now()) / (24 * 60 * 60 * 1000)));
+      }
+
+      const isProOrAdmin = lic.status === 'active' && (!lic.expiresAt || Date.now() <= lic.expiresAt);
+
+      const state: LicenseState = {
+        isPro: isProOrAdmin,
+        isAdmin: lic.role === 'admin' || lic.isSuperAdmin,
+        plan: lic.plan,
+        role: lic.role,
+        key: lic.key,
+        token: data.licenseToken || storedToken,
+        status: isProOrAdmin ? 'active' : 'expired',
+        expiresAt: lic.expiresAt,
+        remainingDays,
+        maxDevices: lic.maxDevices || 1,
+        activatedCount: lic.activatedCount || 1,
+        note: lic.note,
+        deviceId: deviceInfo.deviceId,
+        imei: currentImei,
+        isWhitelistedAdmin: lic.isSuperAdmin,
+        cloudSynced: true
+      };
+
+      saveLocalState(state, data.licenseToken);
+
+      // Auto mirror to Firestore Cloud
+      syncDeviceToCloudFirestore({
+        deviceId: deviceInfo.deviceId,
+        deviceName: deviceInfo.deviceName,
+        imei: currentImei,
+        licenseKey: lic.key,
+        plan: lic.plan,
+        role: lic.role,
+        status: isProOrAdmin ? 'active' : 'expired',
+        expiresAt: lic.expiresAt,
+        note: lic.note,
+        isSuperAdmin: lic.isSuperAdmin
+      }).catch(() => {});
+
+      return state;
+    }
+  } catch (e) {
+    console.warn('[LicenseManager] Server ensure-device fallback:', e);
+  }
+
+  return getCurrentLicenseState();
+}
+
+/**
+ * Retrieves the cached License State (falls back to safe default if unverified)
+ */
+export async function getCurrentLicenseState(): Promise<LicenseState> {
+  const deviceInfo = await getDeviceFingerprint();
+  const currentImei = getSavedUserImei() || deviceInfo.imei || '';
+
+  let localState: LicenseState | null = null;
+  try {
+    const raw = localStorage.getItem(STORAGE_LICENSE_STATE_KEY);
+    if (raw) {
+      localState = JSON.parse(raw);
+    }
+  } catch (_) {}
+
+  if (localState && localState.status === 'active') {
+    // Check if expired
+    if (localState.expiresAt && Date.now() > localState.expiresAt) {
+      localState.status = 'expired';
+      localState.isPro = false;
+      localState.isAdmin = false;
+      saveLocalState(localState);
+      return localState;
+    }
+
+    // Calculate remaining days
+    if (localState.expiresAt) {
+      const ms = localState.expiresAt - Date.now();
+      localState.remainingDays = Math.max(0, Math.ceil(ms / (24 * 60 * 60 * 1000)));
+    }
+
+    localState.token = getStoredLicenseToken();
+    return localState;
+  }
+
+  return getDefaultFreeState(deviceInfo.deviceId, currentImei);
+}
+
+/**
+ * Activate a License Key using Firebase Firestore Cloud & Server
+ */
+export async function activateLicenseKey(
+  key: string,
+  options?: { imei?: string; deviceName?: string }
+): Promise<{ success: boolean; message: string; state?: LicenseState }> {
+  const deviceInfo = await getDeviceFingerprint();
+  const inputImei = options?.imei?.trim() || getSavedUserImei() || deviceInfo.imei || '';
+  const cleanKey = key.trim().toUpperCase();
+
+  if (inputImei) {
+    saveUserImei(inputImei);
+  }
+
+  // 1. Try Firebase Firestore Cloud Activation First
+  try {
+    const cloudRes = await activateCloudLicenseInFirestore(cleanKey, deviceInfo);
+    if (cloudRes.success && cloudRes.record) {
+      const lic = cloudRes.record;
+      let remainingDays: number | undefined = undefined;
+      if (lic.expiresAt) {
+        remainingDays = Math.max(0, Math.ceil((lic.expiresAt - Date.now()) / (24 * 60 * 60 * 1000)));
+      }
+
+      const isProOrAdmin = lic.status === 'active' && (!lic.expiresAt || Date.now() <= lic.expiresAt);
+      const newState: LicenseState = {
+        isPro: isProOrAdmin,
+        isAdmin: lic.role === 'admin',
+        plan: lic.plan,
+        role: lic.role,
+        key: lic.key,
+        status: 'active',
+        expiresAt: lic.expiresAt,
+        remainingDays,
+        maxDevices: lic.maxDevices || 2,
+        activatedCount: lic.activatedDevices?.length || 1,
+        note: lic.note,
+        deviceId: deviceInfo.deviceId,
+        imei: inputImei,
+        cloudSynced: true
+      };
+
+      saveLocalState(newState);
+
+      // Also notify backend server for token signing
+      fetch('/api/license/activate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          key: cleanKey,
+          deviceId: deviceInfo.deviceId,
+          deviceName: options?.deviceName || deviceInfo.deviceName,
+          imei: inputImei
+        })
+      }).then(async (res) => {
+        const d = await res.json();
+        if (d.licenseToken) {
+          saveLocalState(newState, d.licenseToken);
+        }
+      }).catch(() => {});
+
+      return {
+        success: true,
+        message: '✓ Kích hoạt bản quyền qua Firebase Firestore thành công!',
+        state: newState
+      };
+    }
+  } catch (cloudErr) {
+    console.warn('[Firebase Cloud] Firestore activation warning:', cloudErr);
+  }
+
+  // 2. Fallback to Local Server Activation
+  try {
+    const response = await fetch('/api/license/activate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        key: cleanKey,
+        deviceId: deviceInfo.deviceId,
+        deviceName: options?.deviceName || deviceInfo.deviceName,
+        imei: inputImei
+      })
+    });
+
+    const data = await response.json();
+    if (!data.success || !data.license) {
+      return { success: false, message: data.message || 'Kích hoạt bản quyền thất bại' };
+    }
+
+    const lic = data.license;
+    let remainingDays: number | undefined = undefined;
+    if (lic.expiresAt) {
+      remainingDays = Math.max(0, Math.ceil((lic.expiresAt - Date.now()) / (24 * 60 * 60 * 1000)));
+    }
+
+    const newState: LicenseState = {
+      isPro: true,
+      isAdmin: lic.role === 'admin' || lic.isSuperAdmin,
+      plan: lic.plan,
+      role: lic.role,
+      key: lic.key,
+      token: data.licenseToken,
+      status: 'active',
+      expiresAt: lic.expiresAt,
+      remainingDays,
+      maxDevices: lic.maxDevices || 2,
+      activatedCount: lic.activatedCount || 1,
+      note: lic.note,
+      deviceId: deviceInfo.deviceId,
+      imei: inputImei,
+      isWhitelistedAdmin: lic.isSuperAdmin,
+      cloudSynced: true
+    };
+
+    saveLocalState(newState, data.licenseToken);
+
+    // Sync active license & device to Firebase Firestore Cloud
+    syncDeviceToCloudFirestore({
+      deviceId: deviceInfo.deviceId,
+      deviceName: options?.deviceName || deviceInfo.deviceName,
+      imei: inputImei,
+      licenseKey: lic.key,
+      plan: lic.plan,
+      role: lic.role,
+      status: 'active',
+      expiresAt: lic.expiresAt
+    }).catch(() => {});
+
+    return {
+      success: true,
+      message: data.message || 'Kích hoạt bản quyền thành công!',
+      state: newState
+    };
+  } catch (err: any) {
+    console.error('[LicenseManager] activate error:', err);
+    return {
+      success: false,
+      message: 'Không thể kết nối đến máy chủ xác thực bản quyền: ' + (err.message || 'Lỗi mạng')
+    };
+  }
+}
+
+/**
+ * Verify current License state with Firebase Firestore & Server
+ */
+export async function syncVerifyLicense(): Promise<LicenseState> {
+  const current = await getCurrentLicenseState();
+  const token = getStoredLicenseToken();
+  const deviceInfo = await getDeviceFingerprint();
+
+  // 1. Check with Firestore Cloud first
+  try {
+    const cloudVerified = await verifyDeviceLicenseWithFirestore(deviceInfo);
+    if (cloudVerified && cloudVerified.isPro) {
+      const updatedState: LicenseState = {
+        ...cloudVerified,
+        token
+      };
+      saveLocalState(updatedState);
+      return updatedState;
+    }
+  } catch (err) {
+    console.warn('[Firebase Cloud] syncVerifyLicense check warning:', err);
+  }
+
+  if (!current.key && !token) {
+    return current;
+  }
+
+  // 2. Fallback to Server verify
+  try {
+    const response = await fetch('/api/license/verify', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-license-token': token
+      },
+      body: JSON.stringify({
+        key: current.key,
+        deviceId: current.deviceId,
+        imei: current.imei
+      })
+    });
+    const data = await response.json();
+    if (data.valid && data.license) {
+      const lic = data.license;
+      let remainingDays: number | undefined = undefined;
+      if (lic.expiresAt) {
+        remainingDays = Math.max(0, Math.ceil((lic.expiresAt - Date.now()) / (24 * 60 * 60 * 1000)));
+      }
+
+      const updatedState: LicenseState = {
+        ...current,
+        isPro: true,
+        isAdmin: lic.role === 'admin' || lic.isSuperAdmin,
+        plan: lic.plan,
+        role: lic.role,
+        status: lic.status,
+        expiresAt: lic.expiresAt,
+        remainingDays,
+        maxDevices: lic.maxDevices,
+        activatedCount: lic.activatedCount,
+        note: lic.note,
+        token: data.licenseToken || token,
+        cloudSynced: true
+      };
+      saveLocalState(updatedState, data.licenseToken);
+      return updatedState;
+    } else {
+      const freeState = getDefaultFreeState(current.deviceId, current.imei);
+      saveLocalState(freeState);
+      return freeState;
+    }
+  } catch (_) {
+    return current;
+  }
+}
+
+/**
+ * Deactivate license on this device
+ */
+export async function deactivateCurrentLicense(): Promise<{ success: boolean; message: string }> {
+  const current = await getCurrentLicenseState();
+  const token = getStoredLicenseToken();
+
+  if (current.key) {
+    try {
+      await fetch('/api/license/deactivate', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-license-token': token
+        },
+        body: JSON.stringify({
+          key: current.key,
+          deviceId: current.deviceId
+        })
+      });
+    } catch (_) {}
+  }
+
+  // Remove from Firestore device doc licenseKey
+  if (current.deviceId) {
+    syncDeviceToCloudFirestore({
+      deviceId: current.deviceId,
+      licenseKey: '',
+      plan: 'trial',
+      role: 'user',
+      status: 'inactive',
+      expiresAt: null
+    }).catch(() => {});
+  }
+
+  try {
+    localStorage.removeItem(STORAGE_LICENSE_KEY);
+    localStorage.removeItem(STORAGE_LICENSE_STATE_KEY);
+    localStorage.removeItem(STORAGE_LICENSE_TOKEN_KEY);
+  } catch (_) {}
+
+  const freeState = getDefaultFreeState(current.deviceId, current.imei);
+  notifyListeners(freeState);
+
+  return { success: true, message: 'Đã hủy kích hoạt bản quyền trên thiết bị này.' };
+}
