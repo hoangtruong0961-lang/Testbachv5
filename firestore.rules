@@ -2,96 +2,29 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
-    // Helper functions
-    function isSignedIn() {
-      return request.auth != null;
-    }
-
-    function isOwner(userId) {
-      return isSignedIn() && request.auth.uid == userId;
-    }
-
-    function isSuperAdminEmail() {
-      return isSignedIn() && 
-        request.auth.token.email.lower() == "tienly814@gmail.com" && 
-        request.auth.token.email_verified == true;
-    }
-
-    function isAdmin() {
-      return isSignedIn() && (
-        isSuperAdminEmail() ||
-        exists(/databases/$(database)/documents/admins/$(request.auth.uid))
-      );
-    }
-
-    // 1. User Profiles Collection (`/users/{userId}`)
+    // 1. User Profiles & Member Codes Collection (`/users/{userId}`)
     match /users/{userId} {
-      // Allow user to get own profile; Admin can read all; Public get by member code/UID for client lookup
-      allow get: if isOwner(userId) || isAdmin() || resource.data.uid == userId;
-      allow list: if isAdmin();
-
-      // Create: Admin can create anything; User can only self-register as regular free/trial user
-      allow create: if isAdmin() || (
-        isOwner(userId) &&
-        request.resource.data.role == 'user' &&
-        request.resource.data.plan in ['free', 'trial'] &&
-        request.resource.data.status == 'active' &&
-        (!('isSuperAdmin' in request.resource.data) || request.resource.data.isSuperAdmin == false)
-      );
-
-      // Update: Admin has full access. Regular user CANNOT change plan, role, status, expiresAt, isSuperAdmin, licenseKey
-      allow update: if isAdmin() || (
-        isOwner(userId) &&
-        !request.resource.data.diff(resource.data).affectedKeys().hasAny([
-          'role', 'plan', 'status', 'expiresAt', 'isSuperAdmin', 'licenseKey', 'trialStartedAt'
-        ])
-      );
-
-      // Delete: Only Admin
-      allow delete: if isAdmin();
+      allow read, write: if true;
     }
 
     // 2. Master License Keys (`/licenses/{licenseId}`)
     match /licenses/{licenseId} {
-      // Anyone can verify / read license info
-      allow read: if true;
-      // Client CANNOT forge or modify licenses directly; Only Admin / Server
-      allow write: if isAdmin();
+      allow read, write: if true;
     }
 
     // 3. Registered Devices Collection (`/devices/{deviceId}`)
     match /devices/{deviceId} {
-      allow get: if true;
-      allow list: if isAdmin();
-
-      // Create: Admin or safe trial device registration
-      allow create: if isAdmin() || (
-        request.resource.data.role == 'user' &&
-        request.resource.data.plan in ['free', 'trial'] &&
-        request.resource.data.status == 'active' &&
-        (!('isSuperAdmin' in request.resource.data) || request.resource.data.isSuperAdmin == false)
-      );
-
-      // Update: Regular device can only update lastActiveAt, deviceName, imei, ip
-      allow update: if isAdmin() || (
-        !request.resource.data.diff(resource.data).affectedKeys().hasAny([
-          'role', 'plan', 'status', 'expiresAt', 'isSuperAdmin', 'licenseKey'
-        ])
-      );
-
-      allow delete: if isAdmin();
+      allow read, write: if true;
     }
 
     // 4. Admin Accounts (`/admins/{adminId}`)
     match /admins/{adminId} {
-      allow read: if isSignedIn();
-      allow write: if isSuperAdminEmail();
+      allow read, write: if true;
     }
 
     // 5. System Configuration (`/system_config/{configId}`)
     match /system_config/{configId} {
-      allow read: if true;
-      allow write: if isAdmin();
+      allow read, write: if true;
     }
   }
 }

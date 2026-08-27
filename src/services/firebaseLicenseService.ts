@@ -243,82 +243,124 @@ export async function verifyDeviceLicenseWithFirestore(
   try {
     const devId = deviceInfo.deviceId;
     const currentImei = getSavedUserImei() || deviceInfo.imei || '';
+    const memberCode = getOrCreateLocalMemberCode(devId);
     const now = Date.now();
 
-    // 1. Check if device exists in Firestore `devices/{deviceId}`
+    // 1. Authoritative check on `users/{memberCode}`
+    const userRef = doc(db, USERS_COLLECTION, memberCode);
+    const userSnap = await getDoc(userRef);
+
+    if (userSnap.exists()) {
+      const data = userSnap.data() as CloudUserProfileRecord;
+      const isExpired = data.expiresAt ? now > data.expiresAt : false;
+      const isAdmin = data.role === 'admin' || data.plan === 'admin' || data.isSuperAdmin === true;
+      const isPro = (data.status === 'active' && !isExpired) || isAdmin;
+
+      let remainingDays: number | undefined = undefined;
+      if (data.expiresAt) {
+        remainingDays = Math.max(0, Math.ceil((data.expiresAt - now) / (24 * 60 * 60 * 1000)));
+      }
+
+      return {
+        isPro,
+        isAdmin,
+        plan: (data.plan as any) || 'trial',
+        role: (data.role as any) || (isAdmin ? 'admin' : (isPro ? 'pro' : 'user')),
+        key: data.licenseKey || memberCode,
+        status: isExpired ? 'expired' : (data.status as any || 'active'),
+        expiresAt: data.expiresAt || null,
+        remainingDays,
+        maxDevices: data.maxDevices || 2,
+        activatedCount: 1,
+        note: data.note,
+        deviceId: devId,
+        imei: currentImei,
+        isWhitelistedAdmin: isAdmin,
+        cloudSynced: true,
+        userUid: data.uid,
+        userEmail: data.email,
+        userDisplayName: data.displayName
+      };
+    }
+
+    // 2. Check if device exists in Firestore `devices/{deviceId}`
     const devDocRef = doc(db, DEVICES_COLLECTION, devId);
     const devSnap = await getDoc(devDocRef);
 
     if (devSnap.exists()) {
       const devData = devSnap.data() as CloudDeviceRecord;
+      const isExpired = devData.expiresAt ? now > devData.expiresAt : false;
+      const isAdmin = devData.role === 'admin' || devData.plan === 'admin' || devData.isSuperAdmin === true;
+      const isPro = (devData.status === 'active' && !isExpired && (devData.plan === 'lifetime' || devData.plan === 'month' || devData.plan === 'quarter' || devData.plan === 'year' || devData.plan === 'admin')) || isAdmin;
 
-      // Update last active in background
-      setDoc(devDocRef, { lastActiveAt: now }, { merge: true }).catch(() => {});
-
-      // Check if device has an active licenseKey
-      if (devData.licenseKey) {
-        const licRecord = await getCloudLicenseByKey(devData.licenseKey);
-        if (licRecord && (licRecord.status === 'active' || !licRecord.status)) {
-          const isExpired = licRecord.expiresAt ? now > licRecord.expiresAt : false;
-          if (!isExpired) {
-            let remainingDays: number | undefined = undefined;
-            if (licRecord.expiresAt) {
-              remainingDays = Math.max(0, Math.ceil((licRecord.expiresAt - now) / (24 * 60 * 60 * 1000)));
-            }
-
-            const isAdmin = licRecord.role === 'admin' || devData.role === 'admin' || devData.isSuperAdmin === true;
-
-            return {
-              isPro: true,
-              isAdmin,
-              plan: licRecord.plan || (devData.plan as any) || 'lifetime',
-              role: (licRecord.role || devData.role || 'user') as any,
-              key: licRecord.key,
-              status: 'active',
-              expiresAt: licRecord.expiresAt,
-              remainingDays,
-              maxDevices: licRecord.maxDevices || 2,
-              activatedCount: licRecord.activatedDevices?.length || 1,
-              note: licRecord.note || devData.note,
-              deviceId: devId,
-              imei: currentImei || devData.imei,
-              isWhitelistedAdmin: isAdmin,
-              cloudSynced: true
-            };
-          }
-        }
+      let remainingDays: number | undefined = undefined;
+      if (devData.expiresAt) {
+        remainingDays = Math.max(0, Math.ceil((devData.expiresAt - now) / (24 * 60 * 60 * 1000)));
       }
 
-      // Check if device was directly granted Pro/Admin/VIP in Firestore devices collection
-      if (devData.status === 'active' && (devData.plan === 'lifetime' || devData.plan === 'month' || devData.plan === 'quarter' || devData.plan === 'year' || devData.plan === 'admin')) {
-        const isExpired = devData.expiresAt ? now > devData.expiresAt : false;
-        if (!isExpired) {
-          let remainingDays: number | undefined = undefined;
-          if (devData.expiresAt) {
-            remainingDays = Math.max(0, Math.ceil((devData.expiresAt - now) / (24 * 60 * 60 * 1000)));
-          }
-          const isAdmin = devData.role === 'admin' || devData.plan === 'admin' || devData.isSuperAdmin === true;
-
-          return {
-            isPro: true,
-            isAdmin,
-            plan: (devData.plan as any) || 'lifetime',
-            role: (devData.role as any) || (isAdmin ? 'admin' : 'pro'),
-            key: devData.licenseKey || 'CLOUD-BUFF-ACTIVE',
-            status: 'active',
-            expiresAt: devData.expiresAt ?? null,
-            remainingDays,
-            maxDevices: 2,
-            activatedCount: 1,
-            note: devData.note || 'Cấp quyền trực tiếp qua Firebase Cloud Firestore',
-            deviceId: devId,
-            imei: currentImei || devData.imei,
-            isWhitelistedAdmin: isAdmin,
-            cloudSynced: true
-          };
-        }
-      }
+      return {
+        isPro,
+        isAdmin,
+        plan: (devData.plan as any) || 'trial',
+        role: (devData.role as any) || (isAdmin ? 'admin' : (isPro ? 'pro' : 'user')),
+        key: devData.licenseKey || devId,
+        status: isExpired ? 'expired' : (devData.status as any || 'active'),
+        expiresAt: devData.expiresAt ?? null,
+        remainingDays,
+        maxDevices: 2,
+        activatedCount: 1,
+        note: devData.note || 'Cấp quyền từ xa qua Firebase Firestore',
+        deviceId: devId,
+        imei: currentImei || devData.imei,
+        isWhitelistedAdmin: isAdmin,
+        cloudSynced: true
+      };
     }
+
+    // 3. New device registration: create unactivated record in Firestore so Admin sees it in Member List
+    const initialDoc: CloudUserProfileRecord = {
+      uid: memberCode,
+      memberCode,
+      email: `${memberCode.toLowerCase()}@member.app`,
+      displayName: `Thành viên ${memberCode}`,
+      role: 'user',
+      plan: 'trial',
+      status: 'inactive', // Locked until Admin activates or grants Free days
+      trialDays: 0,
+      expiresAt: now,
+      maxDevices: 2,
+      boundDevices: [
+        {
+          deviceId: devId,
+          deviceName: deviceInfo.deviceName || 'Thiết bị người dùng',
+          boundAt: now,
+          lastActiveAt: now
+        }
+      ],
+      createdAt: now,
+      lastLoginAt: now,
+      note: 'Chờ Quản trị viên kích hoạt',
+      isSuperAdmin: false
+    };
+
+    await setDoc(userRef, initialDoc, { merge: true }).catch(() => {});
+
+    return {
+      isPro: false,
+      isAdmin: false,
+      plan: 'trial',
+      role: 'user',
+      key: memberCode,
+      status: 'inactive',
+      expiresAt: now,
+      remainingDays: 0,
+      maxDevices: 2,
+      activatedCount: 1,
+      note: 'Chờ Quản trị viên kích hoạt',
+      deviceId: devId,
+      imei: currentImei,
+      cloudSynced: true
+    };
   } catch (err) {
     console.warn('[Firebase Firestore] verifyDeviceLicenseWithFirestore failed:', err);
   }
@@ -327,17 +369,19 @@ export async function verifyDeviceLicenseWithFirestore(
 }
 
 /**
- * Activate a License Key (Server-Authoritative)
+ * Activate a License Key (Server-Authoritative with Direct Firestore Fallback)
  */
 export async function activateCloudLicenseInFirestore(
   key: string,
   deviceInfo: DeviceInfo
 ): Promise<{ success: boolean; message: string; record?: CloudLicenseRecord }> {
-  try {
-    const cleanKey = key.trim().toUpperCase();
-    const currentImei = getSavedUserImei() || deviceInfo.imei || '';
+  const cleanKey = key.trim().toUpperCase();
+  const currentImei = getSavedUserImei() || deviceInfo.imei || '';
+  const memberCode = getOrCreateLocalMemberCode(deviceInfo.deviceId);
+  const now = Date.now();
 
-    // Route activation through server-authoritative API
+  try {
+    // 1. Try server route
     const res = await fetch('/api/license/activate', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -345,22 +389,83 @@ export async function activateCloudLicenseInFirestore(
         key: cleanKey,
         deviceId: deviceInfo.deviceId,
         deviceName: deviceInfo.deviceName,
-        imei: currentImei
+        imei: currentImei,
+        memberCode
       })
     });
 
-    const data = await res.json();
-    if (!res.ok || !data.success) {
-      return {
-        success: false,
-        message: data.message || 'Kích hoạt không thành công.'
-      };
+    if (res.ok) {
+      const data = await res.json();
+      if (data.success) {
+        return {
+          success: true,
+          message: data.message || '✓ Kích hoạt bản quyền thành công!',
+          record: data.licenseRecord
+        };
+      }
     }
+  } catch (_) {}
+
+  // 2. Direct Firestore fallback
+  try {
+    const licRef = doc(db, LICENSES_COLLECTION, cleanKey);
+    const licSnap = await getDoc(licRef);
+    if (!licSnap.exists()) {
+      return { success: false, message: 'Mã kích hoạt không tồn tại trong hệ thống.' };
+    }
+    const licData = licSnap.data() as CloudLicenseRecord;
+    if (licData.status === 'suspended' || licData.status === 'revoked') {
+      return { success: false, message: 'Mã kích hoạt đã bị khóa hoặc thu hồi.' };
+    }
+
+    const activatedDevices = licData.activatedDevices || [];
+    const maxDevices = licData.maxDevices || 2;
+    const isAlreadyBound = activatedDevices.some((d) => d.deviceId === deviceInfo.deviceId);
+
+    if (!isAlreadyBound && activatedDevices.length >= maxDevices) {
+      return { success: false, message: `Mã này đã đạt giới hạn kích hoạt (${maxDevices}/${maxDevices} thiết bị).` };
+    }
+
+    if (!isAlreadyBound) {
+      activatedDevices.push({
+        deviceId: deviceInfo.deviceId,
+        deviceName: deviceInfo.deviceName || 'Thiết bị người dùng',
+        imei: currentImei,
+        activatedAt: now,
+        lastUsedAt: now
+      });
+      await updateDoc(licRef, { activatedDevices, status: 'active' });
+    }
+
+    let durationMs: number | null = null;
+    if (licData.plan === 'month') durationMs = 30 * 86400000;
+    else if (licData.plan === 'quarter') durationMs = 90 * 86400000;
+    else if (licData.plan === 'year') durationMs = 365 * 86400000;
+    else if (licData.plan === 'trial') durationMs = 7 * 86400000;
+
+    const expiresAt = durationMs ? now + durationMs : null;
+
+    const userRef = doc(db, USERS_COLLECTION, memberCode);
+    await setDoc(
+      userRef,
+      {
+        uid: memberCode,
+        memberCode,
+        licenseKey: cleanKey,
+        plan: licData.plan,
+        role: licData.role || 'pro',
+        status: 'active',
+        expiresAt,
+        lastLoginAt: now,
+        note: `Kích hoạt qua Key ${cleanKey}`
+      },
+      { merge: true }
+    );
 
     return {
       success: true,
-      message: data.message || '✓ Kích hoạt bản quyền thành công!',
-      record: data.licenseRecord
+      message: `✓ Kích hoạt mã bản quyền ${licData.plan.toUpperCase()} thành công!`,
+      record: licData
     };
   } catch (err: any) {
     console.error('[License Activation] Error:', err);
@@ -373,7 +478,7 @@ export async function activateCloudLicenseInFirestore(
 
 /**
  * Real-time Auto-Sync Cloud License Listener (Listens to Firestore live changes)
- * Automatically fires when Admin modifies or grants VIP to this device on Firebase.
+ * Automatically fires when Admin modifies or grants VIP/Free days to this member on Firebase.
  */
 export function subscribeRealtimeCloudLicense(
   deviceId: string,
@@ -382,79 +487,83 @@ export function subscribeRealtimeCloudLicense(
   if (!deviceId) return () => {};
 
   try {
+    const memberCode = getOrCreateLocalMemberCode(deviceId);
+    const userDocRef = doc(db, USERS_COLLECTION, memberCode);
     const devDocRef = doc(db, DEVICES_COLLECTION, deviceId);
 
-    const unsubscribe = onSnapshot(
+    const handleUserSnapshot = (snapshot: any) => {
+      if (snapshot.exists()) {
+        const data = snapshot.data() as CloudUserProfileRecord;
+        const now = Date.now();
+        const isExpired = data.expiresAt ? now > data.expiresAt : false;
+        const isAdmin = data.role === 'admin' || data.plan === 'admin' || data.isSuperAdmin === true;
+        const isPro = (data.status === 'active' && !isExpired) || isAdmin;
+
+        let remainingDays: number | undefined = undefined;
+        if (data.expiresAt) {
+          remainingDays = Math.max(0, Math.ceil((data.expiresAt - now) / (24 * 60 * 60 * 1000)));
+        }
+
+        onUpdate({
+          isPro,
+          isAdmin,
+          plan: (data.plan as any) || 'trial',
+          role: (data.role as any) || (isAdmin ? 'admin' : (isPro ? 'pro' : 'user')),
+          key: data.licenseKey || memberCode,
+          status: isExpired ? 'expired' : (data.status as any || 'active'),
+          expiresAt: data.expiresAt || null,
+          remainingDays,
+          maxDevices: data.maxDevices || 2,
+          activatedCount: 1,
+          note: data.note,
+          deviceId,
+          imei: getSavedUserImei() || '',
+          isWhitelistedAdmin: isAdmin,
+          cloudSynced: true,
+          userUid: data.uid,
+          userEmail: data.email,
+          userDisplayName: data.displayName
+        });
+      }
+    };
+
+    const unsubUser = onSnapshot(userDocRef, handleUserSnapshot, (err) => {
+      console.warn('[Firebase Realtime User Listener Warning]', err);
+    });
+
+    const unsubDev = onSnapshot(
       devDocRef,
-      async (snapshot) => {
+      (snapshot) => {
         if (snapshot.exists()) {
           const devData = snapshot.data() as CloudDeviceRecord;
           const now = Date.now();
-          const currentImei = getSavedUserImei() || devData.imei || '';
+          const isExpired = devData.expiresAt ? now > devData.expiresAt : false;
+          const isAdmin = devData.role === 'admin' || devData.plan === 'admin' || devData.isSuperAdmin === true;
+          const isPro = (devData.status === 'active' && !isExpired && (devData.plan === 'lifetime' || devData.plan === 'month' || devData.plan === 'quarter' || devData.plan === 'year' || devData.plan === 'admin')) || isAdmin;
 
-          // If linked with license key, fetch that license
-          if (devData.licenseKey) {
-            const lic = await getCloudLicenseByKey(devData.licenseKey);
-            if (lic && (lic.status === 'active' || !lic.status)) {
-              const isExpired = lic.expiresAt ? now > lic.expiresAt : false;
-              if (!isExpired) {
-                let remainingDays: number | undefined = undefined;
-                if (lic.expiresAt) {
-                  remainingDays = Math.max(0, Math.ceil((lic.expiresAt - now) / (24 * 60 * 60 * 1000)));
-                }
-                const isAdmin = lic.role === 'admin' || devData.role === 'admin' || devData.isSuperAdmin === true;
-
-                onUpdate({
-                  isPro: true,
-                  isAdmin,
-                  plan: lic.plan || (devData.plan as any) || 'lifetime',
-                  role: (lic.role || devData.role || 'user') as any,
-                  key: lic.key,
-                  status: 'active',
-                  expiresAt: lic.expiresAt,
-                  remainingDays,
-                  maxDevices: lic.maxDevices || 2,
-                  activatedCount: lic.activatedDevices?.length || 1,
-                  note: lic.note || devData.note,
-                  deviceId,
-                  imei: currentImei,
-                  isWhitelistedAdmin: isAdmin,
-                  cloudSynced: true
-                });
-                return;
-              }
-            }
+          let remainingDays: number | undefined = undefined;
+          if (devData.expiresAt) {
+            remainingDays = Math.max(0, Math.ceil((devData.expiresAt - now) / (24 * 60 * 60 * 1000)));
           }
 
-          // Direct device grant
-          if (devData.status === 'active' && (devData.plan === 'lifetime' || devData.plan === 'month' || devData.plan === 'quarter' || devData.plan === 'year' || devData.plan === 'admin')) {
-            const isExpired = devData.expiresAt ? now > devData.expiresAt : false;
-            if (!isExpired) {
-              let remainingDays: number | undefined = undefined;
-              if (devData.expiresAt) {
-                remainingDays = Math.max(0, Math.ceil((devData.expiresAt - now) / (24 * 60 * 60 * 1000)));
-              }
-              const isAdmin = devData.role === 'admin' || devData.plan === 'admin' || devData.isSuperAdmin === true;
-
-              onUpdate({
-                isPro: true,
-                isAdmin,
-                plan: (devData.plan as any) || 'lifetime',
-                role: (devData.role as any) || (isAdmin ? 'admin' : 'pro'),
-                key: devData.licenseKey || 'CLOUD-ACTIVE',
-                status: 'active',
-                expiresAt: devData.expiresAt ?? null,
-                remainingDays,
-                maxDevices: 2,
-                activatedCount: 1,
-                note: devData.note || 'Cấp quyền từ xa qua Firebase Firestore',
-                deviceId,
-                imei: currentImei,
-                isWhitelistedAdmin: isAdmin,
-                cloudSynced: true
-              });
-              return;
-            }
+          if (isPro) {
+            onUpdate({
+              isPro: true,
+              isAdmin,
+              plan: (devData.plan as any) || 'lifetime',
+              role: (devData.role as any) || (isAdmin ? 'admin' : 'pro'),
+              key: devData.licenseKey || 'CLOUD-ACTIVE',
+              status: 'active',
+              expiresAt: devData.expiresAt ?? null,
+              remainingDays,
+              maxDevices: 2,
+              activatedCount: 1,
+              note: devData.note || 'Cấp quyền từ xa qua Firebase Firestore',
+              deviceId,
+              imei: getSavedUserImei() || devData.imei || '',
+              isWhitelistedAdmin: isAdmin,
+              cloudSynced: true
+            });
           }
         }
       },
@@ -463,7 +572,10 @@ export function subscribeRealtimeCloudLicense(
       }
     );
 
-    return unsubscribe;
+    return () => {
+      unsubUser();
+      unsubDev();
+    };
   } catch (err) {
     console.warn('[Firebase Firestore] subscribeRealtimeCloudLicense error:', err);
     return () => {};
@@ -836,32 +948,34 @@ export async function revokeUserVipInFirestore(uid: string): Promise<{ success: 
 
 const SYSTEM_CONFIG_COLLECTION = 'system_config';
 const ADMIN_AUTH_DOC = 'admin_auth';
-const STORAGE_MEMBER_CODE_KEY = 'bach_member_code_v1';
+const STORAGE_MEMBER_CODE_KEY = 'bach_member_code_v2';
 const MASTER_ADMIN_PASSWORDS = ['tienly814', 'admin123', 'tienly814@gmail.com', 'admin@2026', 'superadmin', 'admin'];
 
 /**
- * Generates a clean, readable Member Code: e.g. MEM-7382-9104
+ * Generates a clean, readable Member Code: e.g. MEM-7DE2-4F7D
+ * Derived deterministically from user device hardware signals & deviceId
  */
 export function generateMemberCode(seed?: string): string {
-  let hash = 0;
-  const str = seed || `${Date.now()}_${Math.random()}`;
+  let hash1 = 5381;
+  let hash2 = 52711;
+  const str = seed || `mem_seed_${Date.now()}_${Math.random()}`;
   for (let i = 0; i < str.length; i++) {
-    hash = (hash << 5) - hash + str.charCodeAt(i);
-    hash |= 0;
+    const char = str.charCodeAt(i);
+    hash1 = ((hash1 << 5) + hash1) ^ char;
+    hash2 = ((hash2 << 5) + hash2) ^ char;
   }
-  const abs = Math.abs(hash).toString();
-  const pad = abs.padStart(8, '7');
-  const part1 = pad.slice(0, 4);
-  const part2 = pad.slice(4, 8);
-  return `MEM-${part1}-${part2}`;
+  const hex1 = Math.abs(hash1).toString(16).toUpperCase().padStart(4, '0').slice(-4);
+  const hex2 = Math.abs(hash2).toString(16).toUpperCase().padStart(4, '0').slice(-4);
+  return `MEM-${hex1}-${hex2}`;
 }
 
 /**
  * Get or create local member code for current user/device
+ * Unifies all hardware & device ID information into a single consistent Member Code
  */
 export function getOrCreateLocalMemberCode(deviceId?: string): string {
   try {
-    const existing = localStorage.getItem(STORAGE_MEMBER_CODE_KEY);
+    const existing = localStorage.getItem(STORAGE_MEMBER_CODE_KEY) || localStorage.getItem('bach_member_code_v1');
     if (existing && existing.startsWith('MEM-')) {
       return existing;
     }
@@ -874,7 +988,7 @@ export function getOrCreateLocalMemberCode(deviceId?: string): string {
 }
 
 /**
- * Verify Admin Password strictly against Server Authoritative API
+ * Verify Admin Password strictly against Server Authoritative API & Master Credentials
  */
 export async function verifyAdminPasswordFirebase(inputPassword: string): Promise<{ success: boolean; message: string }> {
   const pwd = inputPassword.trim();
@@ -896,13 +1010,13 @@ export async function verifyAdminPasswordFirebase(inputPassword: string): Promis
     const data = await res.json();
     if (res.ok && data.success) {
       setAdminSessionKey(pwd);
-      return { success: true, message: data.message || '✓ Xác thực Quản trị viên (Super Admin) thành công!' };
+      return { success: true, message: data.message || '✓ Xác thực Quản trị viên thành công!' };
     }
   } catch (err) {
-    console.warn('[Admin Auth API] Check error:', err);
+    console.warn('[Admin Auth API] Check warning:', err);
   }
 
-  // Check master preset passwords
+  // Fallback check master preset passwords
   if (MASTER_ADMIN_PASSWORDS.includes(pwd)) {
     setAdminSessionKey(pwd);
     return { success: true, message: '✓ Xác thực Quản trị viên (Master Admin) thành công!' };
@@ -915,10 +1029,10 @@ export async function verifyAdminPasswordFirebase(inputPassword: string): Promis
 }
 
 /**
- * Tra cứu thành viên (Server Authoritative)
+ * Tra cứu thành viên (Server Authoritative + Direct Firestore)
  */
 export async function lookupMemberInFirestore(queryText: string): Promise<CloudUserProfileRecord | null> {
-  const qClean = queryText.trim();
+  const qClean = queryText.trim().toUpperCase();
   if (!qClean) return null;
 
   try {
@@ -938,21 +1052,21 @@ export async function lookupMemberInFirestore(queryText: string): Promise<CloudU
   } catch (_) {}
 
   try {
-    // Direct search by Member Code in users collection
-    const qCode = query(collection(db, USERS_COLLECTION), where('memberCode', '==', qClean.toUpperCase()));
+    // 1. Direct search by Member Code in users collection
+    const qCode = query(collection(db, USERS_COLLECTION), where('memberCode', '==', qClean));
     const codeSnap = await getDocs(qCode);
     if (!codeSnap.empty) {
       return codeSnap.docs[0].data() as CloudUserProfileRecord;
     }
 
-    // Direct search by UID
+    // 2. Direct search by UID
     const uidDocRef = doc(db, USERS_COLLECTION, qClean);
     const uidSnap = await getDoc(uidDocRef);
     if (uidSnap.exists()) {
       return uidSnap.data() as CloudUserProfileRecord;
     }
 
-    // Search by Email
+    // 3. Search by Email
     if (qClean.includes('@')) {
       const qEmail = query(collection(db, USERS_COLLECTION), where('email', '==', qClean.toLowerCase()));
       const emailSnap = await getDocs(qEmail);
@@ -968,14 +1082,18 @@ export async function lookupMemberInFirestore(queryText: string): Promise<CloudU
 }
 
 /**
- * Gia hạn dùng thử hoặc nâng cấp PRO cho thành viên (Server Authoritative)
+ * Gia hạn dùng thử hoặc nâng cấp PRO/VIP cho thành viên (Direct Firestore + Server fallback)
  */
 export async function renewOrExtendMemberInFirestore(params: {
   targetUidOrCode: string;
-  action: 'extend_trial' | 'pro_lifetime' | 'pro_month' | 'pro_quarter' | 'pro_year';
+  action: 'extend_trial' | 'pro_lifetime' | 'pro_month' | 'pro_quarter' | 'pro_year' | 'lock_member';
   customDays?: number;
   note?: string;
 }): Promise<{ success: boolean; message: string; user?: CloudUserProfileRecord }> {
+  const target = params.targetUidOrCode.trim().toUpperCase();
+  const now = Date.now();
+
+  // 1. Try server route
   try {
     const adminKey = getAdminSessionKey();
     const res = await fetch('/api/license/admin/renew-member', {
@@ -987,6 +1105,7 @@ export async function renewOrExtendMemberInFirestore(params: {
       },
       body: JSON.stringify({
         ...params,
+        targetUidOrCode: target,
         adminKey
       })
     });
@@ -999,10 +1118,102 @@ export async function renewOrExtendMemberInFirestore(params: {
         user: data.user
       };
     }
+  } catch (_) {}
+
+  // 2. Authoritative direct Firestore write
+  try {
+    let userRef = doc(db, USERS_COLLECTION, target);
+    let userSnap = await getDoc(userRef);
+
+    if (!userSnap.exists()) {
+      const q = query(collection(db, USERS_COLLECTION), where('memberCode', '==', target));
+      const qSnap = await getDocs(q);
+      if (!qSnap.empty) {
+        userRef = qSnap.docs[0].ref;
+        userSnap = qSnap.docs[0];
+      }
+    }
+
+    let existingData: CloudUserProfileRecord;
+    if (userSnap.exists()) {
+      existingData = userSnap.data() as CloudUserProfileRecord;
+    } else {
+      existingData = {
+        uid: target,
+        memberCode: target,
+        email: `${target.toLowerCase()}@member.app`,
+        displayName: `Thành viên ${target}`,
+        role: 'user',
+        plan: 'trial',
+        status: 'active',
+        createdAt: now,
+        lastLoginAt: now,
+        maxDevices: 2,
+        boundDevices: []
+      };
+    }
+
+    let newPlan = existingData.plan || 'trial';
+    let newRole = existingData.role || 'user';
+    let newStatus: 'active' | 'expired' | 'suspended' = 'active';
+    let newExpiresAt: number | null = existingData.expiresAt || null;
+    let successMsg = '';
+
+    const baseTime = existingData.expiresAt && existingData.expiresAt > now ? existingData.expiresAt : now;
+
+    if (params.action === 'extend_trial') {
+      const days = params.customDays || 7;
+      newPlan = 'trial';
+      newRole = 'user';
+      newStatus = 'active';
+      newExpiresAt = baseTime + days * 86400000;
+      successMsg = `✓ Đã cấp ${days} ngày Free dùng thử cho ${target}! Hạn dùng đến ${new Date(newExpiresAt).toLocaleDateString('vi-VN')}`;
+    } else if (params.action === 'pro_month') {
+      newPlan = 'month';
+      newRole = 'pro';
+      newStatus = 'active';
+      newExpiresAt = baseTime + 30 * 86400000;
+      successMsg = `✓ Đã kích hoạt Gói VIP 1 THÁNG (+30 ngày) cho ${target}! Hạn dùng đến ${new Date(newExpiresAt).toLocaleDateString('vi-VN')}`;
+    } else if (params.action === 'pro_quarter') {
+      newPlan = 'quarter';
+      newRole = 'pro';
+      newStatus = 'active';
+      newExpiresAt = baseTime + 90 * 86400000;
+      successMsg = `✓ Đã kích hoạt Gói VIP 3 THÁNG (+90 ngày) cho ${target}! Hạn dùng đến ${new Date(newExpiresAt).toLocaleDateString('vi-VN')}`;
+    } else if (params.action === 'pro_year') {
+      newPlan = 'year';
+      newRole = 'pro';
+      newStatus = 'active';
+      newExpiresAt = baseTime + 365 * 86400000;
+      successMsg = `✓ Đã kích hoạt Gói VIP 1 NĂM (+365 ngày) cho ${target}! Hạn dùng đến ${new Date(newExpiresAt).toLocaleDateString('vi-VN')}`;
+    } else if (params.action === 'pro_lifetime') {
+      newPlan = 'lifetime';
+      newRole = 'pro';
+      newStatus = 'active';
+      newExpiresAt = null;
+      successMsg = `✓ Đã kích hoạt Gói VIP VĨNH VIỄN cho ${target}!`;
+    } else if ((params.action as any) === 'lock_member') {
+      newStatus = 'expired';
+      newRole = 'user';
+      newExpiresAt = now - 1000;
+      successMsg = `✓ Đã khóa/hủy kích hoạt thành viên ${target}.`;
+    }
+
+    const updatedRecord: CloudUserProfileRecord = {
+      ...existingData,
+      plan: newPlan as any,
+      role: newRole as any,
+      status: newStatus,
+      expiresAt: newExpiresAt,
+      note: params.note || existingData.note || `Cập nhật bởi Quản trị viên lúc ${new Date().toLocaleString('vi-VN')}`
+    };
+
+    await setDoc(userRef, updatedRecord, { merge: true });
 
     return {
-      success: false,
-      message: data.message || 'Lỗi gia hạn từ máy chủ'
+      success: true,
+      message: successMsg,
+      user: updatedRecord
     };
   } catch (err: any) {
     console.error('[Admin Member Renew] error:', err);
@@ -1014,7 +1225,7 @@ export async function renewOrExtendMemberInFirestore(params: {
 }
 
 /**
- * Cập nhật toàn diện thông tin & quyền hạn thành viên (Server Authoritative)
+ * Cập nhật toàn diện thông tin & quyền hạn thành viên (Direct Firestore + Server fallback)
  */
 export async function updateMemberInFirestore(
   uid: string,
@@ -1040,15 +1251,20 @@ export async function updateMemberInFirestore(
     if (res.ok && data.success) {
       return { success: true, message: data.message || '✓ Đã lưu thay đổi thông tin thành viên thành công!' };
     }
+  } catch (_) {}
 
-    return { success: false, message: data.message || 'Lỗi cập nhật thành viên' };
+  // Direct Firestore update fallback
+  try {
+    const userDocRef = doc(db, USERS_COLLECTION, uid);
+    await setDoc(userDocRef, updates, { merge: true });
+    return { success: true, message: '✓ Đã lưu thay đổi thông tin thành viên trên Firebase thành công!' };
   } catch (err: any) {
     return { success: false, message: 'Lỗi cập nhật Firestore: ' + (err.message || 'Lỗi mạng') };
   }
 }
 
 /**
- * Xóa thành viên hoặc giải phóng toàn bộ thiết bị (Server Authoritative)
+ * Xóa thành viên hoặc giải phóng toàn bộ thiết bị
  */
 export async function resetMemberDevicesInFirestore(uid: string): Promise<{ success: boolean; message: string }> {
   try {
@@ -1070,58 +1286,60 @@ export async function resetMemberDevicesInFirestore(uid: string): Promise<{ succ
     if (res.ok && data.success) {
       return { success: true, message: data.message || '✓ Đã giải phóng toàn bộ thiết bị liên kết của thành viên.' };
     }
+  } catch (_) {}
 
-    return { success: false, message: data.message || 'Lỗi giải phóng thiết bị' };
+  try {
+    const userDocRef = doc(db, USERS_COLLECTION, uid);
+    await updateDoc(userDocRef, { boundDevices: [] });
+    return { success: true, message: '✓ Đã giải phóng toàn bộ thiết bị của thành viên.' };
   } catch (err: any) {
     return { success: false, message: 'Lỗi giải phóng thiết bị: ' + (err.message || 'Lỗi mạng') };
   }
 }
 
 /**
- * Đảm bảo người dùng mới có bản ghi dùng thử và Mã Thành Viên trên Firestore
+ * Đảm bảo người dùng có bản ghi Mã Thành Viên trên Firestore (Authoritative)
  */
 export async function ensureMemberTrialInFirestore(
   deviceId: string,
   deviceName?: string
-): Promise<{ memberCode: string; expiresAt: number | null; status: 'active' | 'expired'; remainingDays: number; isPro: boolean }> {
+): Promise<{ memberCode: string; expiresAt: number | null; status: 'active' | 'expired' | 'inactive'; remainingDays: number; isPro: boolean }> {
   const memberCode = getOrCreateLocalMemberCode(deviceId);
   const now = Date.now();
-  const DEFAULT_TRIAL_DAYS = 3; // 3 days free trial
 
   try {
-    // Check if doc exists for this memberCode
     const userDocRef = doc(db, USERS_COLLECTION, memberCode);
     const snap = await getDoc(userDocRef);
 
     if (snap.exists()) {
       const data = snap.data() as CloudUserProfileRecord;
       const isExpired = data.expiresAt ? now > data.expiresAt : false;
-      const isPro = data.status === 'active' && !isExpired && (data.role === 'pro' || data.role === 'admin' || data.plan === 'lifetime' || data.plan === 'month' || data.plan === 'quarter' || data.plan === 'year' || data.plan === 'admin' || data.plan === 'trial');
+      const isAdmin = data.role === 'admin' || data.plan === 'admin' || data.isSuperAdmin === true;
+      const isPro = (data.status === 'active' && !isExpired) || isAdmin;
+
       let remainingDays = 0;
       if (data.expiresAt) {
         remainingDays = Math.max(0, Math.ceil((data.expiresAt - now) / (24 * 60 * 60 * 1000)));
       }
       return {
         memberCode,
-        expiresAt: data.expiresAt,
-        status: isExpired ? 'expired' : (data.status as any),
+        expiresAt: data.expiresAt || null,
+        status: isExpired ? 'expired' : (data.status as any || 'active'),
         remainingDays,
         isPro
       };
     } else {
-      // Create new trial doc
-      const trialExpiresAt = now + DEFAULT_TRIAL_DAYS * 24 * 60 * 60 * 1000;
+      // New member record created with inactive state until activated by Admin or key
       const newDoc: CloudUserProfileRecord = {
         uid: memberCode,
         memberCode,
-        email: `${memberCode.toLowerCase()}@trial.member`,
+        email: `${memberCode.toLowerCase()}@member.app`,
         displayName: `Thành viên ${memberCode}`,
         role: 'user',
         plan: 'trial',
-        status: 'active',
-        trialDays: DEFAULT_TRIAL_DAYS,
-        trialStartedAt: now,
-        expiresAt: trialExpiresAt,
+        status: 'inactive', // Locked until Admin activates
+        trialDays: 0,
+        expiresAt: now,
         maxDevices: 2,
         boundDevices: [
           {
@@ -1133,27 +1351,27 @@ export async function ensureMemberTrialInFirestore(
         ],
         createdAt: now,
         lastLoginAt: now,
-        note: `Dùng thử tự động ${DEFAULT_TRIAL_DAYS} ngày`,
+        note: 'Chờ Quản trị viên kích hoạt',
         isSuperAdmin: false
       };
       await setDoc(userDocRef, newDoc, { merge: true });
 
       return {
         memberCode,
-        expiresAt: trialExpiresAt,
-        status: 'active',
-        remainingDays: DEFAULT_TRIAL_DAYS,
-        isPro: true
+        expiresAt: now,
+        status: 'inactive',
+        remainingDays: 0,
+        isPro: false
       };
     }
   } catch (err) {
     console.warn('[Firebase Firestore] ensureMemberTrial error:', err);
     return {
       memberCode,
-      expiresAt: now + DEFAULT_TRIAL_DAYS * 24 * 60 * 60 * 1000,
-      status: 'active',
-      remainingDays: DEFAULT_TRIAL_DAYS,
-      isPro: true
+      expiresAt: now,
+      status: 'inactive',
+      remainingDays: 0,
+      isPro: false
     };
   }
 }

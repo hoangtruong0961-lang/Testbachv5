@@ -23,6 +23,7 @@ import {
   loginWithGoogleAccount,
   syncVerifyLicense
 } from '../utils/licenseManager';
+import { getOrCreateLocalMemberCode } from '../services/firebaseLicenseService';
 import { getDeviceFingerprint, DeviceInfo } from '../utils/deviceFingerprint';
 
 interface LockScreenGateProps {
@@ -50,7 +51,8 @@ export const LockScreenGate: React.FC<LockScreenGateProps> = ({
   }, []);
 
   const displayMemberCode =
-    licenseState?.memberCode || deviceInfo?.deviceId || 'VT-7DE2-4F7D';
+    licenseState?.memberCode ||
+    (deviceInfo ? getOrCreateLocalMemberCode(deviceInfo.deviceId) : getOrCreateLocalMemberCode());
 
   const handleCopyCode = async () => {
     try {
