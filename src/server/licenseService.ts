@@ -48,27 +48,44 @@ export interface SignedLicensePayload {
 const DATA_DIR = path.join(process.cwd(), 'data');
 const LICENSES_FILE = path.join(DATA_DIR, 'licenses.json');
 const SECRET_FILE = path.join(DATA_DIR, 'server_secret.key');
-
-// Server-Only Secrets & Whitelists (NEVER exposed to client bundle)
-export const WHITELISTED_ADMIN_IMEIS = [
-  '868621072187630',
-  '868621072187622'
-];
-
-export const WHITELISTED_ADMIN_IPS = [
-  '192.168.1.19',
-  '127.0.0.1',
-  '::1',
-  'localhost'
-];
-
-export const MASTER_ADMIN_KEY = process.env.MASTER_ADMIN_KEY || 'ADMIN-MASTER-TIENLY-LIFETIME';
+const MASTER_KEY_FILE = path.join(DATA_DIR, 'master_admin.key');
 
 function ensureDataDir(): void {
   if (!fs.existsSync(DATA_DIR)) {
     fs.mkdirSync(DATA_DIR, { recursive: true });
   }
 }
+
+/**
+ * Get or initialize persistent Master Admin Secret Key
+ * Strictly server-authoritative: NEVER defaults to a public hardcoded credential.
+ */
+export function getMasterAdminKey(): string {
+  const envKey = process.env.MASTER_ADMIN_KEY?.trim();
+  if (envKey && envKey.length >= 8) {
+    return envKey;
+  }
+
+  ensureDataDir();
+  try {
+    if (fs.existsSync(MASTER_KEY_FILE)) {
+      const persistedKey = fs.readFileSync(MASTER_KEY_FILE, 'utf-8').trim();
+      if (persistedKey.length >= 16) return persistedKey;
+    }
+  } catch (_) {}
+
+  // Generate a cryptographically secure random 64-char hex key if not provided in environment
+  const generatedKey = `ADMIN-KEY-${crypto.randomBytes(24).toString('hex').toUpperCase()}`;
+  try {
+    fs.writeFileSync(MASTER_KEY_FILE, generatedKey, { encoding: 'utf-8', mode: 0o600 });
+    console.warn(`[SECURITY WARNING] MASTER_ADMIN_KEY is not set in environment variables! An auto-generated secure master key was created and saved to data/master_admin.key.`);
+  } catch (err) {
+    console.error('[LicenseService] Failed to persist generated master key:', err);
+  }
+  return generatedKey;
+}
+
+export const MASTER_ADMIN_KEY = getMasterAdminKey();
 
 /**
  * Get or initialize persistent Server HMAC Secret
@@ -212,8 +229,8 @@ function getInitialStore(): LicenseDataStore {
 
   return {
     version: 1,
-    whitelistedImeis: WHITELISTED_ADMIN_IMEIS,
-    whitelistedIps: WHITELISTED_ADMIN_IPS,
+    whitelistedImeis: [],
+    whitelistedIps: [],
     adminEmails: ['tienly814@gmail.com'],
     licenses: [adminLicense, sampleProLifetime, sampleProMonth]
   };
@@ -226,18 +243,12 @@ export function loadLicenseStore(): LicenseDataStore {
       const raw = fs.readFileSync(LICENSES_FILE, 'utf-8');
       const parsed = JSON.parse(raw) as LicenseDataStore;
       
-      // Ensure master admin key and imeis always exist
+      // Ensure master admin key always exists
       let modified = false;
       if (!parsed.licenses.some(l => l.key === MASTER_ADMIN_KEY)) {
         parsed.licenses.unshift(getInitialStore().licenses[0]);
         modified = true;
       }
-      WHITELISTED_ADMIN_IMEIS.forEach(imei => {
-        if (!parsed.whitelistedImeis.includes(imei)) {
-          parsed.whitelistedImeis.push(imei);
-          modified = true;
-        }
-      });
       if (modified) {
         saveLicenseStore(parsed);
       }
@@ -262,11 +273,10 @@ export function saveLicenseStore(store: LicenseDataStore): void {
 }
 
 /**
- * Check if a request or device credentials match Super Admin Whitelist
+ * Check if a request or credentials match Super Admin Secret
  * Strictly server-authoritative:
- * 1. Master Admin Key: requires knowing the secret master key.
- * 2. IP Whitelist: server-measured client IP (localhost / 192.168.1.19).
- * NOTE: Unauthenticated client-supplied strings (email, imei) MUST NEVER auto-grant Super Admin.
+ * Requires knowing the secret MASTER_ADMIN_KEY.
+ * NOTE: IP, IMEI, or unverified client strings MUST NEVER grant Super Admin access.
  */
 export function isSuperAdminCredential(options: {
   key?: string;
@@ -274,19 +284,25 @@ export function isSuperAdminCredential(options: {
   imei?: string;
   email?: string;
 }): boolean {
-  const { key, ip } = options;
+  const { key } = options;
 
-  // 1. Master Secret Admin Key validation
-  if (key && (key.trim() === MASTER_ADMIN_KEY || key.trim().toUpperCase() === MASTER_ADMIN_KEY)) {
-    return true;
+  if (!key || typeof key !== 'string') {
+    return false;
   }
 
-  // 2. Verified Server-Measured IP Whitelist (localhost / local admin network)
-  if (ip && WHITELISTED_ADMIN_IPS.includes(ip.trim())) {
-    return true;
-  }
+  const cleanKey = key.trim();
+  const masterKey = getMasterAdminKey();
 
-  return false;
+  // Timing safe comparison to prevent timing side-channel attacks
+  try {
+    const keyBuf = Buffer.from(cleanKey);
+    const masterBuf = Buffer.from(masterKey);
+    if (keyBuf.length === masterBuf.length && crypto.timingSafeEqual(keyBuf, masterBuf)) {
+      return true;
+    }
+  } catch (_) {}
+
+  return cleanKey === masterKey || cleanKey.toUpperCase() === masterKey.toUpperCase();
 }
 
 /**
@@ -321,57 +337,7 @@ export function ensureDeviceLicense(params: {
   const clientIp = (params.ip || '').trim();
   const now = Date.now();
 
-  // 1. Super Admin Whitelist Check (Only via verified Server IP or Master Key)
-  if (isSuperAdminCredential({ ip: clientIp })) {
-    let adminLic = store.licenses.find(l => l.key === MASTER_ADMIN_KEY);
-    if (!adminLic) {
-      adminLic = getInitialStore().licenses[0];
-      store.licenses.unshift(adminLic);
-    }
-    
-    if (normalizedDeviceId && !adminLic.activatedDevices.some(d => d.deviceId === normalizedDeviceId)) {
-      adminLic.activatedDevices.push({
-        deviceId: normalizedDeviceId,
-        deviceName: params.deviceName || (normalizedImei ? `Admin Device (${normalizedImei})` : 'Super Admin Machine'),
-        imei: normalizedImei,
-        ip: clientIp,
-        activatedAt: now,
-        lastUsedAt: now
-      });
-      saveLicenseStore(store);
-    }
-
-    const token = generateSignedLicenseToken({
-      deviceId: normalizedDeviceId,
-      role: 'admin',
-      plan: 'admin',
-      key: MASTER_ADMIN_KEY,
-      status: 'active',
-      expiresAt: null,
-      issuedAt: now,
-      imei: normalizedImei,
-      isSuperAdmin: true
-    });
-
-    return {
-      success: true,
-      isSuperAdmin: true,
-      licenseToken: token,
-      license: {
-        key: MASTER_ADMIN_KEY,
-        plan: 'admin',
-        role: 'admin',
-        status: 'active',
-        expiresAt: null,
-        maxDevices: 9999,
-        activatedCount: adminLic.activatedDevices.length,
-        isSuperAdmin: true,
-        note: '👑 SUPER ADMIN VÔ HẠN (Tien Ly) - Full Quản trị License'
-      }
-    };
-  }
-
-  // 2. Check if this device is already bound to any existing valid license key
+  // 1. Check if this device is already bound to any existing valid license key
   const existingLic = store.licenses.find(l => 
     l.status === 'active' && 
     l.activatedDevices.some(d => d.deviceId === normalizedDeviceId)
@@ -504,8 +470,8 @@ export function activateLicense(params: {
   const clientIp = (params.ip || '').trim();
   const now = Date.now();
 
-  // 1. Check Super Admin Whitelist Match (Instant Grant)
-  if (isSuperAdminCredential({ key: normalizedKey, imei: normalizedImei, ip: clientIp })) {
+  // 1. Check Super Admin Key Match (Instant Grant)
+  if (isSuperAdminCredential({ key: normalizedKey })) {
     const adminLic = store.licenses.find(l => l.key === MASTER_ADMIN_KEY) || getInitialStore().licenses[0];
     
     // Register current device if not already in admin license
@@ -720,8 +686,8 @@ export function verifyLicense(params: {
   const clientIp = (params.ip || '').trim();
   const now = Date.now();
 
-  // Super Admin check
-  if (isSuperAdminCredential({ key: normalizedKey, imei: normalizedImei, ip: clientIp })) {
+  // Super Admin secret key check
+  if (isSuperAdminCredential({ key: normalizedKey })) {
     const adminLic = store.licenses.find(l => l.key === MASTER_ADMIN_KEY) || getInitialStore().licenses[0];
     const token = generateSignedLicenseToken({
       deviceId: normalizedDeviceId,
@@ -1101,3 +1067,222 @@ export function adminListConnectedDevices(): {
     devices: Array.from(deviceMap.values()).sort((a, b) => b.lastUsedAt - a.lastUsedAt)
   };
 }
+
+export interface ServerUserProfile {
+  uid: string;
+  memberCode?: string;
+  email: string;
+  displayName?: string;
+  photoURL?: string;
+  role: 'user' | 'pro' | 'admin';
+  plan: 'free' | 'trial' | 'month' | 'quarter' | 'year' | 'lifetime' | 'admin';
+  status: 'active' | 'expired' | 'suspended';
+  expiresAt: number | null;
+  maxDevices: number;
+  boundDevices: Array<{
+    deviceId: string;
+    deviceName?: string;
+    boundAt: number;
+    lastActiveAt: number;
+  }>;
+  createdAt: number;
+  lastLoginAt: number;
+  note?: string;
+  isSuperAdmin?: boolean;
+}
+
+const USERS_FILE = path.join(DATA_DIR, 'users.json');
+
+export function loadUsersStore(): Record<string, ServerUserProfile> {
+  ensureDataDir();
+  try {
+    if (fs.existsSync(USERS_FILE)) {
+      const raw = fs.readFileSync(USERS_FILE, 'utf-8');
+      return JSON.parse(raw);
+    }
+  } catch (err) {
+    console.error('[UsersStore] Read error:', err);
+  }
+  return {};
+}
+
+export function saveUsersStore(store: Record<string, ServerUserProfile>): void {
+  ensureDataDir();
+  try {
+    fs.writeFileSync(USERS_FILE, JSON.stringify(store, null, 2), 'utf-8');
+  } catch (err) {
+    console.error('[UsersStore] Save error:', err);
+  }
+}
+
+/**
+ * Admin: Lookup member across Server & Local store
+ */
+export function adminLookupMember(target: string): ServerUserProfile | null {
+  const users = loadUsersStore();
+  const q = (target || '').trim().toLowerCase();
+  if (!q) return null;
+
+  for (const user of Object.values(users)) {
+    if (
+      user.uid.toLowerCase() === q ||
+      (user.memberCode && user.memberCode.toLowerCase() === q) ||
+      (user.email && user.email.toLowerCase() === q) ||
+      user.boundDevices?.some(d => d.deviceId.toLowerCase() === q)
+    ) {
+      return user;
+    }
+  }
+  return null;
+}
+
+/**
+ * Admin: Renew or Extend Member
+ */
+export function adminRenewOrExtendMember(params: {
+  targetUidOrCode: string;
+  action: 'extend_trial' | 'pro_lifetime' | 'pro_month' | 'pro_quarter' | 'pro_year';
+  customDays?: number;
+  note?: string;
+}): { success: boolean; message: string; user?: ServerUserProfile } {
+  const users = loadUsersStore();
+  const target = (params.targetUidOrCode || '').trim();
+  if (!target) {
+    return { success: false, message: 'Thiếu mã thành viên/UID cần gia hạn' };
+  }
+
+  const existing = adminLookupMember(target);
+  const now = Date.now();
+  const targetUid = existing ? existing.uid : (target.startsWith('MEM-') ? target : `user_${now}`);
+
+  let newPlan: 'trial' | 'month' | 'quarter' | 'year' | 'lifetime' = 'trial';
+  let newRole: 'user' | 'pro' | 'admin' = 'pro';
+  let newExpiresAt: number | null = null;
+  let actionDesc = '';
+
+  const baseExpiresAt = existing?.expiresAt && existing.expiresAt > now ? existing.expiresAt : now;
+
+  if (params.action === 'pro_lifetime') {
+    newPlan = 'lifetime';
+    newRole = 'pro';
+    newExpiresAt = null;
+    actionDesc = 'Kích hoạt PRO VĨNH VIỄN';
+  } else if (params.action === 'extend_trial') {
+    newPlan = 'trial';
+    newRole = 'pro';
+    const days = params.customDays || 7;
+    newExpiresAt = baseExpiresAt + days * 24 * 60 * 60 * 1000;
+    actionDesc = `Gia hạn dùng thử +${days} ngày`;
+  } else if (params.action === 'pro_month') {
+    newPlan = 'month';
+    newRole = 'pro';
+    newExpiresAt = baseExpiresAt + 30 * 24 * 60 * 60 * 1000;
+    actionDesc = 'Nâng cấp Gói 1 Tháng (+30 ngày)';
+  } else if (params.action === 'pro_quarter') {
+    newPlan = 'quarter';
+    newRole = 'pro';
+    newExpiresAt = baseExpiresAt + 90 * 24 * 60 * 60 * 1000;
+    actionDesc = 'Nâng cấp Gói 3 Tháng (+90 ngày)';
+  } else if (params.action === 'pro_year') {
+    newPlan = 'year';
+    newRole = 'pro';
+    newExpiresAt = baseExpiresAt + 365 * 24 * 60 * 60 * 1000;
+    actionDesc = 'Nâng cấp Gói 1 Năm (+365 ngày)';
+  }
+
+  const note = params.note
+    ? `${params.note} (Admin: ${actionDesc} lúc ${new Date().toLocaleDateString('vi-VN')})`
+    : `Admin: ${actionDesc} lúc ${new Date().toLocaleDateString('vi-VN')}`;
+
+  const updatedRecord: ServerUserProfile = existing
+    ? {
+        ...existing,
+        role: newRole,
+        plan: newPlan,
+        status: 'active',
+        expiresAt: newExpiresAt,
+        note
+      }
+    : {
+        uid: targetUid,
+        memberCode: target.startsWith('MEM-') ? target : `MEM-${crypto.randomBytes(4).toString('hex').toUpperCase().slice(0, 4)}-${crypto.randomBytes(4).toString('hex').toUpperCase().slice(0, 4)}`,
+        email: target.includes('@') ? target : `${targetUid.toLowerCase()}@member.app`,
+        displayName: `Thành viên ${target}`,
+        role: newRole,
+        plan: newPlan,
+        status: 'active',
+        expiresAt: newExpiresAt,
+        maxDevices: 2,
+        boundDevices: [],
+        createdAt: now,
+        lastLoginAt: now,
+        note
+      };
+
+  users[updatedRecord.uid] = updatedRecord;
+  saveUsersStore(users);
+
+  return {
+    success: true,
+    message: `✓ Đã ${actionDesc} thành công cho thành viên ${updatedRecord.memberCode || updatedRecord.email}!`,
+    user: updatedRecord
+  };
+}
+
+/**
+ * Admin: Update Member Profile directly
+ */
+export function adminUpdateMember(
+  uid: string,
+  updates: Partial<ServerUserProfile>
+): { success: boolean; message: string; user?: ServerUserProfile } {
+  const users = loadUsersStore();
+  const existing = users[uid] || adminLookupMember(uid);
+  if (!existing) {
+    return { success: false, message: 'Không tìm thấy thành viên cần cập nhật' };
+  }
+
+  const updated: ServerUserProfile = {
+    ...existing,
+    ...updates,
+    uid: existing.uid
+  };
+
+  users[updated.uid] = updated;
+  saveUsersStore(users);
+
+  return {
+    success: true,
+    message: '✓ Cập nhật thông tin thành viên thành công!',
+    user: updated
+  };
+}
+
+/**
+ * Admin: Reset Member Devices
+ */
+export function adminResetMemberDevices(uid: string): { success: boolean; message: string } {
+  const users = loadUsersStore();
+  const existing = users[uid] || adminLookupMember(uid);
+  if (!existing) {
+    return { success: false, message: 'Không tìm thấy thành viên' };
+  }
+
+  existing.boundDevices = [];
+  users[existing.uid] = existing;
+  saveUsersStore(users);
+
+  return {
+    success: true,
+    message: '✓ Đã giải phóng toàn bộ thiết bị của thành viên thành công!'
+  };
+}
+
+/**
+ * Admin: List all members
+ */
+export function adminListAllMembers(): ServerUserProfile[] {
+  const users = loadUsersStore();
+  return Object.values(users).sort((a, b) => (b.lastLoginAt || 0) - (a.lastLoginAt || 0));
+}
+

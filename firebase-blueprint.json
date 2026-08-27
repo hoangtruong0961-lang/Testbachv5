@@ -1,5 +1,38 @@
 {
   "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "User account and license ownership linked to authenticated Google UID",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "description": "Google Firebase User UID" },
+        "email": { "type": "string", "description": "Google Email" },
+        "displayName": { "type": "string" },
+        "photoURL": { "type": "string" },
+        "role": { "type": "string", "enum": ["user", "pro", "admin"] },
+        "plan": { "type": "string", "enum": ["free", "trial", "month", "quarter", "year", "lifetime", "admin"] },
+        "status": { "type": "string", "enum": ["active", "expired", "suspended"] },
+        "expiresAt": { "type": "number" },
+        "licenseKey": { "type": "string" },
+        "maxDevices": { "type": "number" },
+        "boundDevices": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "deviceId": { "type": "string" },
+              "deviceName": { "type": "string" },
+              "boundAt": { "type": "number" },
+              "lastActiveAt": { "type": "number" }
+            }
+          }
+        },
+        "createdAt": { "type": "number" },
+        "lastLoginAt": { "type": "number" },
+        "note": { "type": "string" }
+      },
+      "required": ["uid", "email", "role", "plan", "status", "createdAt"]
+    },
     "License": {
       "title": "License",
       "description": "Software license key configuration, plan type, and device binding constraints",
@@ -53,6 +86,10 @@
   },
   "firestore": {
     "collections": {
+      "users": {
+        "entity": "UserProfile",
+        "description": "Authenticated Google user profiles and license ownership"
+      },
       "licenses": {
         "entity": "License",
         "description": "Master cloud license records"

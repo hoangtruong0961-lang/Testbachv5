@@ -55,6 +55,7 @@ import {
 import { getDeviceFingerprint, DeviceInfo } from '../utils/deviceFingerprint';
 import { getCurrentLicenseState, subscribeLicenseState, LicenseState } from '../utils/licenseManager';
 import { getFirebaseUser } from '../services/firebaseLicenseService';
+import NativeGeminiWebView, { isNativeGeminiWebViewSupported } from '../plugins/geminiWebView';
 
 interface ConfigViewProps {
   settings: AppSettings;
@@ -317,6 +318,43 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
     setGoogleLogs((prev) => [...prev.slice(-35), `[${timestamp}] ${line}`]);
   };
 
+  const handleFetchGeminiSessionNative = async () => {
+    setIsCheckingGoogleToken(true);
+    setGoogleAuthMessage(null);
+    appendGoogleLog('[GeminiNative] Bắt đầu khởi tạo WebView ẩn trên Android để kết nối gemini.google.com/app...');
+
+    try {
+      if (!isNativeGeminiWebViewSupported()) {
+        throw new Error(
+          'Thiết bị đang chạy trên trình duyệt Web. Tính năng WebView ẩn tự động chỉ khả dụng khi chạy trên App Android/iOS (Capacitor). Vui lòng dán Cookie thủ công.'
+        );
+      }
+
+      appendGoogleLog('[GeminiNative] WebView Android đang nạp trang https://gemini.google.com/app...');
+      const sessionResult = await NativeGeminiWebView.fetchGeminiSession();
+
+      if (!sessionResult || !sessionResult.success) {
+        throw new Error('Không lấy được phiên từ Gemini Web. Vui lòng đảm bảo bạn đã đăng nhập tài khoản Google trên máy.');
+      }
+
+      appendGoogleLog(`[GeminiNative] Trích xuất thành công Cookie (${sessionResult.cookies ? sessionResult.cookies.length : 0} bytes) & token SNlM0e.`);
+
+      if (sessionResult.cookies) {
+        // Tiếp tục xác thực và lưu token qua luồng check-token
+        await handleCheckGoogleToken(sessionResult.cookies);
+      } else {
+        throw new Error('WebView không nhận diện được Cookie Google nào.');
+      }
+    } catch (err: any) {
+      appendGoogleLog(`[GeminiNative Error] ${err.message || 'Lỗi lấy phiên tự động'}`);
+      setGoogleAuthMessage({
+        text: err.message || 'Lỗi khi lấy phiên tự động qua WebView ẩn.',
+        isError: true,
+      });
+      setIsCheckingGoogleToken(false);
+    }
+  };
+
   const handleCheckGoogleToken = async (customCookie?: string) => {
     setIsCheckingGoogleToken(true);
     setGoogleAuthMessage(null);
@@ -484,10 +522,10 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
             </div>
             <div>
               <h2 className="text-sm font-bold text-white flex items-center gap-1.5">
-                <span>Mã Thành Viên & Định Danh Thiết Bị</span>
+                <span>Mã Thành Viên</span>
               </h2>
               <p className="text-[11px] text-slate-400">
-                Mã phần cứng máy tính / trình duyệt duy nhất của bạn
+                Mã định danh duy nhất dùng để kích hoạt, tra cứu và nâng cấp VIP
               </p>
             </div>
           </div>
@@ -499,32 +537,32 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
               className="px-3 py-1.5 bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-400 hover:to-amber-500 text-slate-950 font-bold text-[11px] rounded-xl shadow transition flex items-center gap-1.5 cursor-pointer shrink-0"
             >
               <Crown className="w-3.5 h-3.5 fill-slate-950" />
-              <span>{licenseState?.isAdmin ? 'Quản Trị VIP' : 'Nâng Cấp VIP'}</span>
+              <span>Admin Panel</span>
             </button>
           )}
         </div>
 
-        {/* Member Code / Device ID Main Display Box */}
-        <div className="bg-[#0e0e12] border border-amber-500/20 rounded-xl p-3 space-y-2">
+        {/* Member Code Main Display Box */}
+        <div className="bg-[#0e0e12] border border-amber-500/20 rounded-xl p-3 space-y-2.5">
           <div className="flex items-center justify-between">
             <label className="text-[11px] font-bold text-amber-300 uppercase tracking-wide flex items-center gap-1.5">
               <User className="w-3.5 h-3.5 text-amber-400" />
-              <span>Mã Thành Viên (Member ID / Device ID):</span>
+              <span>Mã Thành Viên (Member Code):</span>
             </label>
-            <span className="text-[10px] text-slate-400">Dùng để kích hoạt hoặc cấp quyền VIP</span>
+            <span className="text-[10px] text-slate-400">Gửi mã này cho Admin để kích hoạt VIP</span>
           </div>
 
-          <div className="flex items-center justify-between gap-2 bg-[#16161e] border border-slate-700/80 rounded-lg px-3 py-2">
+          <div className="flex items-center justify-between gap-2 bg-[#16161e] border border-slate-700/80 rounded-lg px-3 py-2.5">
             <span className="font-mono text-xs sm:text-sm font-black text-amber-200 tracking-wider select-all break-all">
-              {deviceInfo?.deviceId || 'Đang nhận diện mã máy...'}
+              {licenseState?.memberCode || deviceInfo?.deviceId || 'Đang tạo mã thành viên...'}
             </span>
             <button
               type="button"
-              onClick={() => handleCopyText(deviceInfo?.deviceId || '', 'deviceId')}
-              className="px-2.5 py-1 bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/40 rounded-lg text-xs font-bold transition flex items-center gap-1 cursor-pointer shrink-0"
+              onClick={() => handleCopyText(licenseState?.memberCode || deviceInfo?.deviceId || '', 'memberCode')}
+              className="px-3 py-1.5 bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/40 rounded-lg text-xs font-bold transition flex items-center gap-1.5 cursor-pointer shrink-0"
               title="Sao chép Mã Thành Viên"
             >
-              {copiedField === 'deviceId' ? (
+              {copiedField === 'memberCode' ? (
                 <>
                   <Check className="w-3.5 h-3.5 text-emerald-400" />
                   <span className="text-emerald-300">Đã chép!</span>
@@ -532,48 +570,43 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
               ) : (
                 <>
                   <Copy className="w-3.5 h-3.5" />
-                  <span>Sao chép</span>
+                  <span>Sao chép mã</span>
                 </>
               )}
             </button>
           </div>
 
-          {/* Detailed Specs Grid */}
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 pt-1">
-            {/* IMEI */}
-            <div className="bg-[#121217] border border-slate-800 rounded-lg p-2 flex items-center justify-between">
-              <div className="space-y-0.5 min-w-0 pr-2">
-                <span className="text-[10px] text-slate-400 block font-semibold">Mã IMEI / Định Danh:</span>
-                <span className="font-mono text-[11px] text-slate-200 font-bold truncate block">
-                  {deviceInfo?.imei || 'Chưa thiết lập IMEI'}
-                </span>
-              </div>
-              {deviceInfo?.imei && (
-                <button
-                  type="button"
-                  onClick={() => handleCopyText(deviceInfo.imei || '', 'imei')}
-                  className="p-1 text-slate-400 hover:text-white rounded hover:bg-slate-800 transition cursor-pointer"
-                  title="Sao chép IMEI"
-                >
-                  {copiedField === 'imei' ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
-                </button>
-              )}
-            </div>
-
-            {/* License Plan & Expiry */}
-            <div className="bg-[#121217] border border-slate-800 rounded-lg p-2 flex items-center justify-between">
+          {/* License Status & Device Info */}
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 pt-0.5">
+            <div className="bg-[#121217] border border-slate-800 rounded-lg p-2.5 flex items-center justify-between">
               <div className="space-y-0.5 min-w-0">
-                <span className="text-[10px] text-slate-400 block font-semibold">Trạng Thái Bản Quyền:</span>
+                <span className="text-[10px] text-slate-400 block font-semibold">Gói Bản Quyền:</span>
                 <span className="text-[11px] text-emerald-300 font-bold block">
                   {licenseState?.isAdmin
                     ? 'Super Admin (Vĩnh Viễn)'
                     : licenseState?.isPro
-                    ? `VIP ${licenseState.plan.toUpperCase()} (${licenseState.expiresAt ? new Date(licenseState.expiresAt).toLocaleDateString('vi-VN') : 'Vĩnh Viễn'})`
+                    ? `VIP ${licenseState.plan.toUpperCase()}`
                     : 'Gói Dùng Thử Miễn Phí'}
                 </span>
               </div>
               <span className="text-[10px] bg-slate-800 text-slate-300 px-2 py-0.5 rounded font-mono">
-                {licenseState?.status === 'active' ? 'Active' : 'Free'}
+                {licenseState?.status === 'active' ? 'Active' : 'Trial'}
+              </span>
+            </div>
+
+            <div className="bg-[#121217] border border-slate-800 rounded-lg p-2.5 flex items-center justify-between">
+              <div className="space-y-0.5 min-w-0">
+                <span className="text-[10px] text-slate-400 block font-semibold">Thời Hạn Sử Dụng:</span>
+                <span className="text-[11px] text-slate-200 font-bold block">
+                  {licenseState?.isAdmin
+                    ? 'Không giới hạn'
+                    : licenseState?.expiresAt
+                    ? new Date(licenseState.expiresAt).toLocaleDateString('vi-VN')
+                    : 'Vĩnh Viễn'}
+                </span>
+              </div>
+              <span className="text-[10px] text-slate-400">
+                {licenseState?.remainingDays !== undefined ? `${licenseState.remainingDays} ngày` : '∞'}
               </span>
             </div>
           </div>
@@ -584,7 +617,7 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
               <Cloud className="w-3.5 h-3.5" />
               <span className="flex items-center gap-1">
                 <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping mr-0.5 inline-block" />
-                Firebase Cloud Real-Time Auto Sync: <b className="text-emerald-300">Đã kết nối Firestore</b>
+                Firebase Cloud Real-Time: <b className="text-emerald-300">Đã kết nối Firestore</b>
                 {getFirebaseUser()?.email && <span className="text-slate-400">({getFirebaseUser()?.email})</span>}
               </span>
             </span>
@@ -1162,7 +1195,21 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
               </div>
 
               {/* Action Buttons Group */}
-              <div className="flex items-center gap-2 w-full sm:w-auto">
+              <div className="flex flex-wrap items-center gap-2 w-full sm:w-auto">
+                <button
+                  type="button"
+                  onClick={handleFetchGeminiSessionNative}
+                  disabled={isCheckingGoogleToken}
+                  className="flex-1 sm:flex-initial px-3 py-1.5 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white font-bold text-xs rounded-xl shadow-md flex items-center justify-center gap-1.5 transition cursor-pointer disabled:opacity-50"
+                  title="Tự động khởi tạo WebView ẩn trên Android để trích xuất Cookie và mã SNlM0e"
+                >
+                  {isCheckingGoogleToken ? (
+                    <Loader2 className="w-3.5 h-3.5 animate-spin text-white" />
+                  ) : (
+                    <Zap className="w-3.5 h-3.5 text-white" />
+                  )}
+                  <span>Tự Động Kết Nối (WebView Ẩn)</span>
+                </button>
                 <button
                   type="button"
                   onClick={() => handleCheckGoogleToken()}
@@ -1189,6 +1236,7 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
                   </button>
                 )}
               </div>
+
             </div>
 
             {/* Status notification banner */}

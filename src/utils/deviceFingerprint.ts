@@ -1,5 +1,6 @@
 import { Device } from '@capacitor/device';
 import { Capacitor } from '@capacitor/core';
+import NativeHardwareId from '../plugins/hardwareId';
 
 /**
  * Client-Side Device Fingerprint Generator
@@ -97,10 +98,24 @@ export async function getDeviceFingerprint(): Promise<DeviceInfo> {
 
   try {
     if (Capacitor.isNativePlatform()) {
-      const devIdResult = await Device.getId();
-      if (devIdResult && devIdResult.identifier) {
-        nativeId = `DEV-${devIdResult.identifier.toUpperCase().slice(0, 16)}`;
+      // Ưu tiên 1: Lấy ANDROID_ID thực tế từ Custom Kotlin Plugin
+      try {
+        const customRes = await NativeHardwareId.getAndroidId();
+        if (customRes && customRes.androidId) {
+          nativeId = `DEV-${customRes.androidId.toUpperCase().slice(0, 16)}`;
+        }
+      } catch (customErr) {
+        console.debug('[Custom HardwareId Plugin] fallback to standard device:', customErr);
       }
+
+      // Ưu tiên 2: Fallback qua Device Plugin mặc định nếu chưa có
+      if (!nativeId) {
+        const devIdResult = await Device.getId();
+        if (devIdResult && devIdResult.identifier) {
+          nativeId = `DEV-${devIdResult.identifier.toUpperCase().slice(0, 16)}`;
+        }
+      }
+
       const infoResult = await Device.getInfo();
       if (infoResult) {
         nativeModel = infoResult.model || '';

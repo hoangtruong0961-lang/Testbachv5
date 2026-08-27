@@ -30,12 +30,15 @@ import {
   adminDeleteKey,
   adminBuffTarget,
   adminListConnectedDevices,
+  adminRenewOrExtendMember,
+  adminUpdateMember,
+  adminResetMemberDevices,
+  adminLookupMember,
+  adminListAllMembers,
   isSuperAdminCredential,
   verifySignedLicenseToken,
   generateSignedLicenseToken,
-  MASTER_ADMIN_KEY,
-  WHITELISTED_ADMIN_IMEIS,
-  WHITELISTED_ADMIN_IPS
+  MASTER_ADMIN_KEY
 } from './src/server/licenseService';
 import {
   validateAndExtractGeminiWebSession,
@@ -517,6 +520,9 @@ async function stretchAudioWithAtempo(
 async function startServer() {
   const app = express();
   const PORT = 3000;
+
+  // Trust first proxy (Cloud Run / Nginx) for accurate req.ip resolution
+  app.set('trust proxy', 1);
 
   // CORS & WASM Multi-threading Security Headers
   app.use((req, res, next) => {
@@ -4346,42 +4352,104 @@ ${JSON.stringify(compactChunk)}`;
 
   // ==========================================
   // LICENSE MANAGEMENT & ACTIVATION API (MODEL 2)
+  // SECURED & AUTHORITATIVE SERVER-SIDE IMPLEMENTATION
   // ==========================================
   
-  // Helper to extract client IP address
+  // Safe extraction of client IP from trusted Express proxy
   const getClientIp = (req: express.Request): string => {
-    const forwarded = req.headers['x-forwarded-for'];
-    if (typeof forwarded === 'string') {
-      return forwarded.split(',')[0].trim();
-    }
-    return req.socket.remoteAddress || req.ip || '';
+    const rawIp = req.ip || req.socket.remoteAddress || '127.0.0.1';
+    return rawIp.replace(/^::ffff:/, '');
   };
 
-  // Unified Admin Authentication Helper (Server-Authoritative)
+  // In-Memory Rate Limiting & Anti-Bruteforce Defense
+  const licenseRateLimitMap = new Map<string, { count: number; resetAt: number }>();
+  const adminFailedAttemptsMap = new Map<string, { count: number; lockUntil: number }>();
+
+  // Cleanup stale rate limit records periodically
+  setInterval(() => {
+    const now = Date.now();
+    for (const [ip, data] of licenseRateLimitMap.entries()) {
+      if (now > data.resetAt) licenseRateLimitMap.delete(ip);
+    }
+    for (const [ip, data] of adminFailedAttemptsMap.entries()) {
+      if (now > data.lockUntil && data.count === 0) adminFailedAttemptsMap.delete(ip);
+    }
+  }, 10 * 60 * 1000);
+
+  // License Request Rate Limiter (Max 30 requests / 60s per IP)
+  const checkLicenseRateLimit = (req: express.Request, res: express.Response): boolean => {
+    const ip = getClientIp(req);
+    const now = Date.now();
+    const record = licenseRateLimitMap.get(ip) || { count: 0, resetAt: now + 60 * 1000 };
+
+    if (now > record.resetAt) {
+      record.count = 0;
+      record.resetAt = now + 60 * 1000;
+    }
+
+    record.count++;
+    licenseRateLimitMap.set(ip, record);
+
+    if (record.count > 30) {
+      const waitSeconds = Math.ceil((record.resetAt - now) / 1000);
+      res.status(429).json({
+        success: false,
+        message: `Bạn gửi quá nhiều yêu cầu xác thực. Vui lòng chờ ${waitSeconds}s trước khi thử lại.`
+      });
+      return false;
+    }
+    return true;
+  };
+
+  // Audit Logging for Admin Operations
+  const logAdminAudit = (action: string, req: express.Request, details?: any) => {
+    const ip = getClientIp(req);
+    const time = new Date().toISOString();
+    console.log(`[ADMIN AUDIT] [${time}] [IP: ${ip}] Action: ${action} | Details:`, details || 'None');
+  };
+
+  // Unified Admin Authentication Helper (Strictly Server-Authoritative)
   const checkAdminAuth = (req: express.Request): { isAuthorized: boolean; reason?: string } => {
     const ip = getClientIp(req);
-    const adminKey = (req.query.key as string) || (req.headers['x-admin-key'] as string) || req.body?.adminKey;
-    const imei = (req.headers['x-imei'] as string) || req.body?.imei;
+    const now = Date.now();
+
+    // Check if IP is currently locked due to too many failed password attempts
+    const lockRecord = adminFailedAttemptsMap.get(ip);
+    if (lockRecord && now < lockRecord.lockUntil) {
+      const waitMinutes = Math.ceil((lockRecord.lockUntil - now) / 60000);
+      return {
+        isAuthorized: false,
+        reason: `IP của bạn đang bị khóa tạm thời (${waitMinutes} phút) do nhập sai mật khẩu admin nhiều lần.`
+      };
+    }
+
+    const authHeader = req.headers['authorization'];
+    const bearerKey = authHeader?.startsWith('Bearer ') ? authHeader.slice(7).trim() : undefined;
+    const adminKey = (req.headers['x-admin-key'] as string) || (req.query.key as string) || req.body?.adminKey || bearerKey;
     const token = (req.headers['x-license-token'] as string) || (req.query.token as string) || req.body?.licenseToken;
 
-    // 1. Check IP, IMEI, or Master Key whitelist
-    if (isSuperAdminCredential({ key: adminKey, imei, ip })) {
+    // 1. Verify Secret Master Key (Timing Safe)
+    if (adminKey && isSuperAdminCredential({ key: adminKey })) {
+      // Clear failed attempts upon successful admin auth
+      adminFailedAttemptsMap.delete(ip);
       return { isAuthorized: true };
     }
 
-    // 2. Check cryptographic signed token
+    // 2. Verify Cryptographic HMAC Signed Token
     if (token) {
       const verified = verifySignedLicenseToken(token);
       if (verified.valid && verified.payload && (verified.payload.role === 'admin' || verified.payload.isSuperAdmin)) {
+        adminFailedAttemptsMap.delete(ip);
         return { isAuthorized: true };
       }
     }
 
-    return { isAuthorized: false, reason: 'Từ chối truy cập: Yêu cầu quyền Super Admin' };
+    return { isAuthorized: false, reason: 'Từ chối truy cập: Yêu cầu mật khẩu hoặc Token Super Admin hợp lệ' };
   };
 
   // Ensure / Auto-provision device license for new user
   app.post('/api/license/ensure-device', (req, res) => {
+    if (!checkLicenseRateLimit(req, res)) return;
     try {
       const { deviceId, deviceName, imei, email } = req.body || {};
       const ip = getClientIp(req);
@@ -4400,6 +4468,7 @@ ${JSON.stringify(compactChunk)}`;
   });
 
   app.post('/api/license/activate', (req, res) => {
+    if (!checkLicenseRateLimit(req, res)) return;
     try {
       const { key, deviceId, deviceName, imei } = req.body || {};
       const ip = getClientIp(req);
@@ -4410,6 +4479,9 @@ ${JSON.stringify(compactChunk)}`;
         imei,
         ip
       });
+      if (result.success && result.license?.isSuperAdmin) {
+        logAdminAudit('activate-superadmin-key', req, { deviceId, deviceName });
+      }
       res.json(result);
     } catch (err: any) {
       console.error('[License API] Activate error:', err);
@@ -4418,6 +4490,7 @@ ${JSON.stringify(compactChunk)}`;
   });
 
   app.post('/api/license/verify', (req, res) => {
+    if (!checkLicenseRateLimit(req, res)) return;
     try {
       const { key, deviceId, imei } = req.body || {};
       const ip = getClientIp(req);
@@ -4435,6 +4508,7 @@ ${JSON.stringify(compactChunk)}`;
   });
 
   app.post('/api/license/deactivate', (req, res) => {
+    if (!checkLicenseRateLimit(req, res)) return;
     try {
       const { key, deviceId } = req.body || {};
       const result = deactivateLicense({ key, deviceId });
@@ -4453,6 +4527,7 @@ ${JSON.stringify(compactChunk)}`;
         return res.status(403).json({ success: false, message: auth.reason || 'Từ chối truy cập: Yêu cầu quyền Super Admin' });
       }
 
+      logAdminAudit('list-keys', req);
       const store = loadLicenseStore();
       res.json({
         success: true,
@@ -4474,6 +4549,7 @@ ${JSON.stringify(compactChunk)}`;
       }
 
       const { plan, customDays, maxDevices, note, count, customPrefix } = req.body || {};
+      logAdminAudit('create-key', req, { plan, customDays, maxDevices, count, customPrefix });
 
       const result = adminCreateKey({
         plan: plan || 'month',
@@ -4499,11 +4575,11 @@ ${JSON.stringify(compactChunk)}`;
       }
 
       const { key } = req.body || {};
-
       if (!key) {
         return res.status(400).json({ success: false, message: 'Thiếu license key cần reset' });
       }
 
+      logAdminAudit('reset-devices', req, { key });
       const result = adminResetKeyDevices(key);
       res.json(result);
     } catch (err: any) {
@@ -4520,11 +4596,11 @@ ${JSON.stringify(compactChunk)}`;
       }
 
       const { key } = req.body || {};
-
       if (!key) {
         return res.status(400).json({ success: false, message: 'Thiếu license key cần thu hồi' });
       }
 
+      logAdminAudit('revoke-key', req, { key });
       const result = adminRevokeKey(key);
       res.json(result);
     } catch (err: any) {
@@ -4541,11 +4617,11 @@ ${JSON.stringify(compactChunk)}`;
       }
 
       const { key } = req.body || {};
-
       if (!key) {
         return res.status(400).json({ success: false, message: 'Thiếu license key cần xóa' });
       }
 
+      logAdminAudit('delete-key', req, { key });
       const result = adminDeleteKey(key);
       res.json(result);
     } catch (err: any) {
@@ -4562,11 +4638,11 @@ ${JSON.stringify(compactChunk)}`;
       }
 
       const { target, plan, customDays, note } = req.body || {};
-
       if (!target) {
         return res.status(400).json({ success: false, message: 'Thiếu thông tin Target (Device ID / IMEI / IP / Key) cần Buff' });
       }
 
+      logAdminAudit('buff-target', req, { target, plan, customDays });
       const result = adminBuffTarget({
         target,
         plan: plan || 'month',
@@ -4588,10 +4664,145 @@ ${JSON.stringify(compactChunk)}`;
         return res.status(403).json({ success: false, message: auth.reason || 'Từ chối truy cập: Yêu cầu quyền Super Admin' });
       }
 
+      logAdminAudit('list-devices', req);
       const result = adminListConnectedDevices();
       res.json(result);
     } catch (err: any) {
       res.status(500).json({ success: false, message: 'Lỗi nạp danh sách thiết bị: ' + err.message });
+    }
+  });
+
+  // Admin API: Verify Admin Password (With Brute-force Throttling Defense)
+  app.post('/api/license/admin/verify-password', (req, res) => {
+    const ip = getClientIp(req);
+    const now = Date.now();
+
+    // Check if IP is temporarily locked
+    const attemptRecord = adminFailedAttemptsMap.get(ip) || { count: 0, lockUntil: 0 };
+    if (now < attemptRecord.lockUntil) {
+      const waitMinutes = Math.ceil((attemptRecord.lockUntil - now) / 60000);
+      return res.status(429).json({
+        success: false,
+        message: `Đã nhập sai mật khẩu quá 5 lần. Tạm khóa xác thực từ IP này trong ${waitMinutes} phút để bảo vệ hệ thống.`
+      });
+    }
+
+    try {
+      const auth = checkAdminAuth(req);
+      if (auth.isAuthorized) {
+        adminFailedAttemptsMap.delete(ip);
+        logAdminAudit('admin-login-success', req);
+        return res.json({ success: true, message: '✓ Xác thực Quản trị viên (Super Admin) thành công!' });
+      }
+
+      // Record failed attempt
+      attemptRecord.count++;
+      if (attemptRecord.count >= 5) {
+        attemptRecord.lockUntil = now + 15 * 60 * 1000; // 15 minute lock
+        adminFailedAttemptsMap.set(ip, attemptRecord);
+        console.warn(`[SECURITY ALERT] IP ${ip} locked for 15 minutes due to 5 consecutive failed admin password attempts.`);
+        return res.status(429).json({
+          success: false,
+          message: 'Đã nhập sai mật khẩu quá 5 lần liên tiếp. Tạm khóa IP này 15 phút để bảo vệ hệ thống.'
+        });
+      } else {
+        adminFailedAttemptsMap.set(ip, attemptRecord);
+        const remaining = 5 - attemptRecord.count;
+        return res.status(403).json({
+          success: false,
+          message: `Mật khẩu quản trị viên không chính xác. Bạn còn ${remaining} lần thử trước khi bị tạm khóa.`
+        });
+      }
+    } catch (err: any) {
+      res.status(500).json({ success: false, message: 'Lỗi xác thực: ' + err.message });
+    }
+  });
+
+  // Admin API: Renew / Extend Member (Trial / VIP / Lifetime)
+  app.post('/api/license/admin/renew-member', (req, res) => {
+    try {
+      const auth = checkAdminAuth(req);
+      if (!auth.isAuthorized) {
+        return res.status(403).json({ success: false, message: auth.reason || 'Từ chối truy cập: Yêu cầu quyền Super Admin' });
+      }
+
+      const { targetUidOrCode, action, customDays, note } = req.body || {};
+      logAdminAudit('renew-member', req, { targetUidOrCode, action, customDays });
+      const result = adminRenewOrExtendMember({
+        targetUidOrCode,
+        action,
+        customDays: customDays ? Number(customDays) : undefined,
+        note
+      });
+
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ success: false, message: 'Lỗi gia hạn thành viên: ' + err.message });
+    }
+  });
+
+  // Admin API: Update Member Information
+  app.post('/api/license/admin/update-member', (req, res) => {
+    try {
+      const auth = checkAdminAuth(req);
+      if (!auth.isAuthorized) {
+        return res.status(403).json({ success: false, message: auth.reason || 'Từ chối truy cập: Yêu cầu quyền Super Admin' });
+      }
+
+      const { uid, updates } = req.body || {};
+      logAdminAudit('update-member', req, { uid, updates });
+      const result = adminUpdateMember(uid, updates || {});
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ success: false, message: 'Lỗi cập nhật thành viên: ' + err.message });
+    }
+  });
+
+  // Admin API: Reset Member Devices
+  app.post('/api/license/admin/reset-member-devices', (req, res) => {
+    try {
+      const auth = checkAdminAuth(req);
+      if (!auth.isAuthorized) {
+        return res.status(403).json({ success: false, message: auth.reason || 'Từ chối truy cập: Yêu cầu quyền Super Admin' });
+      }
+
+      const { uid } = req.body || {};
+      logAdminAudit('reset-member-devices', req, { uid });
+      const result = adminResetMemberDevices(uid);
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ success: false, message: 'Lỗi reset thiết bị thành viên: ' + err.message });
+    }
+  });
+
+  // Admin API: Lookup Member
+  app.get('/api/license/admin/lookup-member', (req, res) => {
+    try {
+      const auth = checkAdminAuth(req);
+      if (!auth.isAuthorized) {
+        return res.status(403).json({ success: false, message: auth.reason || 'Từ chối truy cập: Yêu cầu quyền Super Admin' });
+      }
+
+      const target = (req.query.target as string) || '';
+      const result = adminLookupMember(target);
+      res.json({ success: true, member: result });
+    } catch (err: any) {
+      res.status(500).json({ success: false, message: 'Lỗi tra cứu: ' + err.message });
+    }
+  });
+
+  // Admin API: List all members
+  app.get('/api/license/admin/list-all-users', (req, res) => {
+    try {
+      const auth = checkAdminAuth(req);
+      if (!auth.isAuthorized) {
+        return res.status(403).json({ success: false, message: auth.reason || 'Từ chối truy cập: Yêu cầu quyền Super Admin' });
+      }
+
+      const members = adminListAllMembers();
+      res.json({ success: true, members });
+    } catch (err: any) {
+      res.status(500).json({ success: false, message: 'Lỗi nạp danh sách: ' + err.message });
     }
   });
 

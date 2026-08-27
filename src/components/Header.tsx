@@ -108,7 +108,7 @@ export const Header: React.FC<HeaderProps> = ({
               {licenseState?.isAdmin ? (
                 <>
                   <Crown className="w-3.5 h-3.5 fill-slate-950" />
-                  <span>ADMIN VIP</span>
+                  <span>ADMIN PANEL</span>
                 </>
               ) : licenseState?.isPro ? (
                 <>
@@ -118,7 +118,7 @@ export const Header: React.FC<HeaderProps> = ({
               ) : (
                 <>
                   <KeyRound className="w-3.5 h-3.5 text-amber-400" />
-                  <span>Bản Quyền</span>
+                  <span>Admin Panel</span>
                 </>
               )}
             </button>

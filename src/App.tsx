@@ -3,6 +3,7 @@ import { CapCutHomeView } from './components/CapCutHomeView';
 import { CapCutEditorView } from './components/CapCutEditorView';
 import { HelpModal } from './components/HelpModal';
 import { LicenseModal } from './components/LicenseModal';
+import { LockScreenGate } from './components/LockScreenGate';
 import { Project, GeminiModelOption, RegionROI, AppSettings, VideoClip } from './types';
 import { getSavedProjects, saveProject, deleteProject } from './utils/projectStorage';
 import { getAppSettings, saveAppSettings } from './utils/settingsStorage';
@@ -202,9 +203,30 @@ export default function App() {
   };
 
 
+  // Check if interface should be completely locked due to lack of valid/active license or time expiration
+  const isLicenseValid = Boolean(
+    licenseState &&
+    (
+      licenseState.isAdmin ||
+      licenseState.role === 'admin' ||
+      licenseState.isWhitelistedAdmin ||
+      (
+        licenseState.isPro &&
+        licenseState.status === 'active' &&
+        (!licenseState.expiresAt || licenseState.expiresAt > Date.now() || (licenseState.remainingDays !== undefined && licenseState.remainingDays > 0))
+      )
+    )
+  );
+
   return (
     <>
-      {currentView === 'home' || !activeProject ? (
+      {!isLicenseValid ? (
+        <LockScreenGate
+          licenseState={licenseState}
+          onOpenAdmin={() => setIsLicenseOpen(true)}
+          onLicenseUpdated={(st) => setLicenseState(st)}
+        />
+      ) : currentView === 'home' || !activeProject ? (
         <CapCutHomeView
           projects={projects}
           onOpenProject={handleOpenProject}

@@ -11,7 +11,15 @@ import {
   verifyDeviceLicenseWithFirestore,
   activateCloudLicenseInFirestore,
   subscribeRealtimeCloudLicense,
-  ResolvedCloudLicenseState
+  subscribeRealtimeUserLicense,
+  syncUserProfileOnLogin,
+  signInWithGoogle,
+  logOutFirebase,
+  getFirebaseUser,
+  initFirebaseAuthListener,
+  ResolvedCloudLicenseState,
+  getOrCreateLocalMemberCode,
+  ensureMemberTrialInFirestore
 } from '../services/firebaseLicenseService';
 
 export interface LicenseState {
@@ -19,11 +27,13 @@ export interface LicenseState {
   isAdmin: boolean;
   plan: 'free' | 'trial' | 'month' | 'quarter' | 'year' | 'lifetime' | 'admin';
   role: 'user' | 'pro' | 'admin';
+  memberCode?: string;
   key?: string;
   token?: string;
   status: 'inactive' | 'active' | 'expired' | 'suspended';
   expiresAt: number | null; // null = lifetime
   remainingDays?: number;
+  trialDays?: number;
   maxDevices: number;
   activatedCount: number;
   note?: string;
@@ -31,6 +41,10 @@ export interface LicenseState {
   imei?: string;
   isWhitelistedAdmin?: boolean;
   cloudSynced?: boolean;
+  userUid?: string;
+  userEmail?: string;
+  userDisplayName?: string;
+  userPhotoURL?: string;
 }
 
 const STORAGE_LICENSE_STATE_KEY = 'bach_active_license_state_v3';
@@ -40,6 +54,8 @@ const STORAGE_LICENSE_TOKEN_KEY = 'bach_license_token_v3';
 type LicenseChangeListener = (state: LicenseState) => void;
 const listeners: Set<LicenseChangeListener> = new Set();
 let isCloudListenerStarted = false;
+let isAuthListenerStarted = false;
+let userUnsubscribe: (() => void) | null = null;
 
 export function subscribeLicenseState(fn: LicenseChangeListener): () => void {
   listeners.add(fn);
@@ -53,23 +69,94 @@ function notifyListeners(state: LicenseState) {
 }
 
 /**
- * Returns default Free Tier state
+ * Returns default Free / Trial Tier state
  */
 export function getDefaultFreeState(deviceId: string, imei?: string): LicenseState {
+  const memberCode = getOrCreateLocalMemberCode(deviceId);
   return {
     isPro: false,
     isAdmin: false,
-    plan: 'free',
+    plan: 'trial',
     role: 'user',
+    memberCode,
     status: 'inactive',
     expiresAt: null,
     maxDevices: 1,
     activatedCount: 1,
     deviceId,
     imei,
-    note: 'Bản Dùng Thử Cơ Bản',
+    note: 'Bản Dùng Thử',
     cloudSynced: false
   };
+}
+
+/**
+ * Perform Google Sign-In and retrieve Google UID license
+ */
+export async function loginWithGoogleAccount(): Promise<{ success: boolean; message: string; state?: LicenseState }> {
+  try {
+    const user = await signInWithGoogle();
+    if (!user) {
+      return { success: false, message: 'Đăng nhập Google không thành công.' };
+    }
+
+    const deviceInfo = await getDeviceFingerprint();
+    const cloudState = await syncUserProfileOnLogin(user, deviceInfo);
+
+    const fullState: LicenseState = {
+      ...cloudState,
+      token: getStoredLicenseToken()
+    };
+
+    saveLocalState(fullState);
+
+    // Setup user realtime listener
+    if (userUnsubscribe) {
+      userUnsubscribe();
+    }
+    userUnsubscribe = subscribeRealtimeUserLicense(user.uid, (updatedState) => {
+      if (updatedState) {
+        saveLocalState({
+          ...updatedState,
+          deviceId: deviceInfo.deviceId,
+          token: getStoredLicenseToken()
+        });
+      }
+    });
+
+    return {
+      success: true,
+      message: `✓ Đăng nhập thành công với tài khoản ${user.email}!`,
+      state: fullState
+    };
+  } catch (err: any) {
+    console.error('[LicenseManager] Google Sign In error:', err);
+    return {
+      success: false,
+      message: 'Lỗi đăng nhập Google: ' + (err.message || 'Hủy thao tác')
+    };
+  }
+}
+
+/**
+ * Logout Google Account and reset to local free state
+ */
+export async function logoutGoogleAccount(): Promise<{ success: boolean; message: string }> {
+  try {
+    await logOutFirebase();
+    if (userUnsubscribe) {
+      userUnsubscribe();
+      userUnsubscribe = null;
+    }
+
+    const current = await getCurrentLicenseState();
+    const freeState = getDefaultFreeState(current.deviceId, current.imei);
+    saveLocalState(freeState);
+
+    return { success: true, message: 'Đã đăng xuất tài khoản Google.' };
+  } catch (err: any) {
+    return { success: false, message: 'Lỗi đăng xuất: ' + (err.message || 'Lỗi mạng') };
+  }
 }
 
 /**
@@ -161,12 +248,14 @@ export async function ensureAndSyncDeviceLicense(): Promise<LicenseState> {
       }
 
       const isProOrAdmin = lic.status === 'active' && (!lic.expiresAt || Date.now() <= lic.expiresAt);
+      const memberCode = lic.memberCode || getOrCreateLocalMemberCode(deviceInfo.deviceId);
 
       const state: LicenseState = {
         isPro: isProOrAdmin,
         isAdmin: lic.role === 'admin' || lic.isSuperAdmin,
         plan: lic.plan,
         role: lic.role,
+        memberCode,
         key: lic.key,
         token: data.licenseToken || storedToken,
         status: isProOrAdmin ? 'active' : 'expired',
@@ -201,6 +290,33 @@ export async function ensureAndSyncDeviceLicense(): Promise<LicenseState> {
     }
   } catch (e) {
     console.warn('[LicenseManager] Server ensure-device fallback:', e);
+  }
+
+  // 4. Ensure Member Trial & Member Code in Firestore
+  try {
+    const trialInfo = await ensureMemberTrialInFirestore(deviceInfo.deviceId, deviceInfo.deviceName);
+    if (trialInfo) {
+      const trialState: LicenseState = {
+        isPro: trialInfo.isPro,
+        isAdmin: false,
+        plan: 'trial',
+        role: 'user',
+        memberCode: trialInfo.memberCode,
+        status: trialInfo.status,
+        expiresAt: trialInfo.expiresAt,
+        remainingDays: trialInfo.remainingDays,
+        maxDevices: 2,
+        activatedCount: 1,
+        note: 'Dùng thử tự động',
+        deviceId: deviceInfo.deviceId,
+        imei: currentImei,
+        cloudSynced: true
+      };
+      saveLocalState(trialState);
+      return trialState;
+    }
+  } catch (err) {
+    console.warn('[LicenseManager] Member trial ensure warning:', err);
   }
 
   return getCurrentLicenseState();
