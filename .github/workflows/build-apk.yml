@@ -33,13 +33,15 @@ jobs:
 
       - name: Setup Capacitor Android Platform
         run: |
-          npx cap add android || true
+          if [ ! -d "android" ]; then
+            npx cap add android
+          fi
           npx cap sync android
 
       - name: Build Android Debug APK with Gradle
         working-directory: android
         run: |
-          chmod +x gradlew
+          chmod +x ./gradlew
           ./gradlew assembleDebug --no-daemon --stacktrace
 
       - name: Upload APK Artifact
